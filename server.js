@@ -18,7 +18,8 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' })); 
 
 // MongoDB Connection
-const dbURI = process.env.MONGO_URI || 'mongodb+srv://frosty_medusir:<@2021Jose2021>@cluster.akpr8ge.mongodb.net/?appName=Cluster';
+// FIXED: URL Encoded the '@' in password to '%40' and removed the '>' bracket
+const dbURI = process.env.MONGO_URI || 'mongodb+srv://frosty_medusir:%402021Jose2021@cluster.akpr8ge.mongodb.net/riperide_db?retryWrites=true&w=majority&appName=Cluster';
 
 mongoose.connect(dbURI, {
     useNewUrlParser: true,
