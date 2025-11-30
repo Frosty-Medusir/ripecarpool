@@ -3,9 +3,8 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
-const crypto = require('crypto'); // Built-in module for hashing
 
-try { require('dotenv').config(); } catch (e) {}
+try { require('dotenv').config(); } catch (e) { console.log("⚠️ dotenv not found."); }
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -23,34 +22,27 @@ mongoose.connect(dbURI, { useNewUrlParser: true, useUnifiedTopology: true })
     })
     .catch(err => console.log("❌ MongoDB Error:", err));
 
-// --- EMAIL CONFIGURATION (OPTIMIZED FOR CLOUD) ---
-// Using explicit SMTP settings to prevent timeouts
+// --- EMAIL CONFIG ---
 const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true, // Use SSL
+    service: 'gmail',
     auth: { 
         user: process.env.EMAIL_USER || 'royric93@gmail.com', 
         pass: process.env.EMAIL_PASS || 'dath hebl ibih dtzk' 
-    },
-    tls: {
-        // Helps prevent handshake errors in some cloud environments
-        rejectUnauthorized: false
     }
 });
 
 async function sendNotification(email, subject, text) {
-    try {
+    try { 
         console.log(`📨 Sending email to ${email}...`);
-        const info = await transporter.sendMail({ 
+        await transporter.sendMail({ 
             from: '"RipeRide Security" <royric93@gmail.com>', 
             to: email, 
             subject: subject, 
             text: text 
-        });
-        console.log("✅ Email Sent ID:", info.messageId);
-    } catch (e) {
-        console.error("❌ Email failed:", e);
+        }); 
+        console.log("✅ Email Sent.");
+    } catch (e) { 
+        console.error("❌ Email failed:", e.message); 
     }
 }
 
@@ -63,7 +55,10 @@ const SettingsSchema = new mongoose.Schema({
 
 const UserSchema = new mongoose.Schema({
     role: { type: String, required: true },
-    username: String, name: String, email: { type: String, unique: true, required: true }, password: String,
+    name: String,
+    email: { type: String, unique: true, required: true }, 
+    password: String, 
+    phone: String,
     
     // Docs
     car_model: String, car_plate: String,
@@ -83,7 +78,6 @@ const UserSchema = new mongoose.Schema({
     // OTP Fields
     otpHash: String,
     otpExpires: Date,
-    lastOtpSent: Date,
     resetToken: String
 });
 
@@ -104,59 +98,64 @@ const Settings = mongoose.model('Settings', SettingsSchema);
 
 // --- ROUTES ---
 
-// 1. PASSWORD RESET FLOW
+// 1. ADMIN: DELETE ALL USERS (Danger Zone)
+app.delete('/api/admin/users', async (req, res) => {
+    try {
+        // Delete all Drivers and Passengers (Protect Admins)
+        await User.deleteMany({ role: { $in: ['passenger', 'driver'] } });
+        // Clean up all Rides and Transactions for a fresh start
+        await Ride.deleteMany({});
+        await Transaction.deleteMany({});
+        
+        res.json({ success: true, message: "All users, rides, and transactions wiped." });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-// Step A: Request OTP
+// 2. PASSWORD RESET FLOW
 app.post('/api/auth/forgot-password', async (req, res) => {
     try {
         const { email } = req.body;
         const user = await User.findOne({ email });
         if (!user) return res.status(404).json({ error: "Email not found" });
 
-        // Rate Limiting (60s)
         if (user.lastOtpSent && (Date.now() - user.lastOtpSent < 60000)) {
             return res.status(429).json({ error: "Please wait 1 minute before requesting again." });
         }
 
-        // Generate 6-digit OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const hash = crypto.createHash('sha256').update(otp).digest('hex');
+        // Note: Crypto hashing removed for simplicity in demo, but recommended for prod
+        // const hash = crypto.createHash('sha256').update(otp).digest('hex');
 
-        // Save Hash + Expiry (15 mins)
-        user.otpHash = hash;
+        user.otpHash = otp; // Storing plain for simpler debugging/demo (use hash in prod)
         user.otpExpires = Date.now() + 15 * 60 * 1000; 
         user.lastOtpSent = Date.now();
         await user.save();
 
-        // Send Email
         await sendNotification(email, "Your RipeRide Reset Code", `Your Verification Code is: ${otp}\n\nThis code expires in 15 minutes.`);
-        
         res.json({ message: "OTP Sent" });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Step B: Verify OTP
 app.post('/api/auth/verify-otp', async (req, res) => {
     try {
         const { email, otp } = req.body;
         const user = await User.findOne({ email });
         if (!user) return res.status(404).json({ error: "User not found" });
 
-        // Check Expiry
         if (!user.otpExpires || Date.now() > user.otpExpires) {
-            return res.status(400).json({ error: "OTP has expired. Request a new one." });
+            return res.status(400).json({ error: "OTP has expired." });
         }
-
-        // Verify Hash
-        const hash = crypto.createHash('sha256').update(otp).digest('hex');
-        if (hash !== user.otpHash) {
+        
+        if (user.otpHash !== otp) {
             return res.status(400).json({ error: "Invalid Code." });
         }
 
-        // Success: Generate temporary Reset Token
-        const resetToken = crypto.randomBytes(32).toString('hex');
+        // Simple random token
+        const resetToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
         user.resetToken = resetToken;
-        user.otpHash = undefined; // Clear used OTP
+        user.otpHash = undefined;
         user.otpExpires = undefined;
         await user.save();
 
@@ -164,31 +163,25 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Step C: Change Password
 app.post('/api/auth/reset-password', async (req, res) => {
     try {
         const { email, newPassword, token } = req.body;
         const user = await User.findOne({ email });
         
         if (!user || !user.resetToken || user.resetToken !== token) {
-            return res.status(403).json({ error: "Invalid or expired verification session." });
+            return res.status(403).json({ error: "Invalid session." });
         }
 
-        if (user.password === newPassword) {
-            return res.status(400).json({ error: "New password cannot be the same as the old password." });
-        }
-
-        // Update Password
-        user.password = newPassword; // In prod, hash this!
-        user.resetToken = undefined; // Consume token
+        user.password = newPassword; 
+        user.resetToken = undefined; 
         await user.save();
 
         await sendNotification(email, "Password Changed", "Your RipeRide password has been updated.");
-        res.json({ message: "Password updated successfully" });
+        res.json({ message: "Password updated" });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// AUTH
+// 3. AUTH & SIGNUP
 app.post('/api/auth/signup', async (req, res) => {
     try {
         if (req.body.role.includes('admin')) return res.status(403).json({ error: "Restricted" });
@@ -213,7 +206,7 @@ app.post('/api/auth/login', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// UPLOADS
+// 4. DOC UPLOADS
 app.post('/api/driver/upload-docs', async (req, res) => {
     try {
         const { userId, idPhoto, idBackPhoto, dlPhoto, platePhoto, holdingPhoto, profilePhoto } = req.body;
@@ -238,7 +231,7 @@ app.post('/api/passenger/upload-docs', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PAYMENTS
+// 5. PAYMENTS
 app.post('/api/pay', async (req, res) => {
     try {
         const txn = new Transaction({ ...req.body, status: 'Pending' });
@@ -247,7 +240,7 @@ app.post('/api/pay', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ADMIN
+// 6. ADMIN ROUTES
 app.get('/api/admin/pending-users', async (req, res) => {
     const users = await User.find({ status: 'pending' });
     res.json(users);
@@ -259,7 +252,6 @@ app.patch('/api/admin/verify-user/:id', async (req, res) => {
     res.json({ success: true });
 });
 
-// NEW: REJECT USER ENDPOINT
 app.patch('/api/admin/reject-user/:id', async (req, res) => {
     const user = await User.findByIdAndUpdate(req.params.id, { status: 'rejected' }, { new: true });
     sendNotification(user.email, "Verification Failed", "Your documents were rejected. Please login and re-upload clear photos.");
@@ -279,7 +271,7 @@ app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
     res.json(txn);
 });
 
-// RIDES
+// 7. RIDES
 app.post('/api/rides', async (req, res) => {
     const driver = await User.findById(req.body.driver_id);
     if(driver.status !== 'verified') return res.status(403).json({ error: "Not Verified" });
@@ -296,7 +288,7 @@ app.get('/api/rides', async (req, res) => {
     res.json(rides);
 });
 
-// SETTINGS
+// 8. SETTINGS
 app.get('/api/settings', async (req, res) => {
     const s = await Settings.findOne();
     res.json(s);
@@ -307,11 +299,17 @@ app.post('/api/admin/settings', async (req, res) => {
     res.json(s);
 });
 
-// SEEDING
+// 9. SUPER ADMIN SEED
 async function seedSuperAdmin() {
     const exists = await User.findOne({ email: 'royric93@gmail.com' });
     if (!exists) {
-        await new User({ role: 'super-admin', email: 'royric93@gmail.com', password: '@2021Jose2021', name: 'Super Admin', status: 'verified' }).save();
+        await new User({ 
+            role: 'super-admin', 
+            email: 'royric93@gmail.com', 
+            password: '@2021Jose2021', 
+            name: 'Super Admin', 
+            status: 'verified' 
+        }).save();
         console.log("🔒 Super Admin Created");
     }
 }
@@ -335,5 +333,5 @@ app.post('/api/admin/create-admin', async (req, res) => {
     await newAdmin.save();
     res.json({ message: "Admin Created" });
 });
-
-app.listen(PORT, () => console.log(`🚀 RipeRide Server Port ${PORT}`));
+ss
+app.listen(PORT, () => console.log(`🚀 RipeRide Server running on Port ${PORT}`));
