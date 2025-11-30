@@ -127,7 +127,9 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         }
 
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        user.otpHash = otp; 
+        const hash = crypto.createHash('sha256').update(otp).digest('hex');
+
+        user.otpHash = hash;
         user.otpExpires = Date.now() + 15 * 60 * 1000; 
         user.lastOtpSent = Date.now();
         await user.save();
@@ -147,7 +149,8 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             return res.status(400).json({ error: "OTP has expired." });
         }
         
-        if (user.otpHash !== otp) {
+        const hash = crypto.createHash('sha256').update(otp).digest('hex');
+        if (hash !== user.otpHash) {
             return res.status(400).json({ error: "Invalid Code." });
         }
 
@@ -315,22 +318,26 @@ app.post('/api/admin/settings', async (req, res) => {
 
 // 9. SEEDING
 async function seedSuperAdmin() {
-    const exists = await User.findOne({ email: 'royric93@gmail.com' });
-    if (!exists) {
-        await new User({ 
-            role: 'super-admin', 
-            email: 'royric93@gmail.com', 
-            password: '@2021Jose2021', 
-            name: 'Super Admin', 
-            status: 'verified' 
-        }).save();
-        console.log("🔒 Super Admin Created");
-    }
+    try {
+        const exists = await User.findOne({ email: 'royric93@gmail.com' });
+        if (!exists) {
+            await new User({ 
+                role: 'super-admin', 
+                email: 'royric93@gmail.com', 
+                password: '@2021Jose2021', 
+                name: 'Super Admin', 
+                status: 'verified' 
+            }).save();
+            console.log("🔒 Super Admin Created");
+        }
+    } catch (e) { console.error("Seeding Error:", e); }
 }
 
 async function seedDefaultSettings() {
-    const exists = await Settings.findOne();
-    if (!sexists) await new sSettings({}).save();
+    try {
+        const exists = await Settings.findOne();
+        if (!exists) await new Settings({}).save();
+    } catch (e) {}
 }
 
 app.post('/api/admin/create-admin', async (req, res) => {
