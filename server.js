@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto'); // Built-in module for hashing
 
 try { require('dotenv').config(); } catch (e) { console.log("⚠️ dotenv not found."); }
 
@@ -24,11 +25,14 @@ mongoose.connect(dbURI, { useNewUrlParser: true, useUnifiedTopology: true })
 
 // --- EMAIL CONFIG ---
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true, // Use SSL
     auth: { 
         user: process.env.EMAIL_USER || 'royric93@gmail.com', 
         pass: process.env.EMAIL_PASS || 'dath hebl ibih dtzk' 
-    }
+    },
+    tls: { rejectUnauthorized: false }
 });
 
 async function sendNotification(email, subject, text) {
@@ -78,6 +82,7 @@ const UserSchema = new mongoose.Schema({
     // OTP Fields
     otpHash: String,
     otpExpires: Date,
+    lastOtpSent: Date,
     resetToken: String
 });
 
@@ -101,12 +106,9 @@ const Settings = mongoose.model('Settings', SettingsSchema);
 // 1. ADMIN: DELETE ALL USERS (Danger Zone)
 app.delete('/api/admin/users', async (req, res) => {
     try {
-        // Delete all Drivers and Passengers (Protect Admins)
         await User.deleteMany({ role: { $in: ['passenger', 'driver'] } });
-        // Clean up all Rides and Transactions for a fresh start
         await Ride.deleteMany({});
         await Transaction.deleteMany({});
-        
         res.json({ success: true, message: "All users, rides, and transactions wiped." });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -125,10 +127,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         }
 
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        // Note: Crypto hashing removed for simplicity in demo, but recommended for prod
-        // const hash = crypto.createHash('sha256').update(otp).digest('hex');
-
-        user.otpHash = otp; // Storing plain for simpler debugging/demo (use hash in prod)
+        user.otpHash = otp; 
         user.otpExpires = Date.now() + 15 * 60 * 1000; 
         user.lastOtpSent = Date.now();
         await user.save();
@@ -152,8 +151,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             return res.status(400).json({ error: "Invalid Code." });
         }
 
-        // Simple random token
-        const resetToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
+        const resetToken = crypto.randomBytes(32).toString('hex');
         user.resetToken = resetToken;
         user.otpHash = undefined;
         user.otpExpires = undefined;
@@ -186,12 +184,10 @@ app.post('/api/auth/signup', async (req, res) => {
     try {
         if (req.body.role.includes('admin')) return res.status(403).json({ error: "Restricted" });
         
-        // STRICT EMAIL CHECK (Case Insensitive)
-        const email = req.body.email.toLowerCase();
-        const existingUser = await User.findOne({ email: email });
+        const existingUser = await User.findOne({ email: req.body.email.toLowerCase() });
         if(existingUser) return res.status(400).json({ error: "Email already registered. Please login." });
 
-        const user = new User({ ...req.body, email: email, status: 'pending' });
+        const user = new User({ ...req.body, email: req.body.email.toLowerCase(), status: 'pending' });
         await user.save();
         res.json({ message: "Account created", user });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -242,64 +238,82 @@ app.post('/api/pay', async (req, res) => {
 
 // 6. ADMIN ROUTES
 app.get('/api/admin/pending-users', async (req, res) => {
-    const users = await User.find({ status: 'pending' });
-    res.json(users);
+    try {
+        const users = await User.find({ status: 'pending' });
+        res.json(users);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.patch('/api/admin/verify-user/:id', async (req, res) => {
-    const user = await User.findByIdAndUpdate(req.params.id, { status: 'verified' }, { new: true });
-    sendNotification(user.email, "Verified!", "Your RipeRide account is verified. You now have full access.");
-    res.json({ success: true });
+    try {
+        const user = await User.findByIdAndUpdate(req.params.id, { status: 'verified' }, { new: true });
+        if(user) await sendNotification(user.email, "Verified!", "Your RipeRide account is verified. You now have full access.");
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.patch('/api/admin/reject-user/:id', async (req, res) => {
-    const user = await User.findByIdAndUpdate(req.params.id, { status: 'rejected' }, { new: true });
-    sendNotification(user.email, "Verification Failed", "Your documents were rejected. Please login and re-upload clear photos.");
-    res.json({ success: true });
+    try {
+        const user = await User.findByIdAndUpdate(req.params.id, { status: 'rejected' }, { new: true });
+        if(user) await sendNotification(user.email, "Verification Failed", "Your documents were rejected. Please login and re-upload clear photos.");
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/admin/transactions', async (req, res) => {
-    const txns = await Transaction.find({ status: 'Pending' });
-    res.json(txns);
+    try {
+        const txns = await Transaction.find({ status: 'Pending' });
+        res.json(txns);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
-    const txn = await Transaction.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
-    if(req.body.status === 'Verified' && txn.type === 'driver_subscription') {
-        await User.findByIdAndUpdate(txn.user_id, { is_subscribed: true });
-    }
-    res.json(txn);
+    try {
+        const txn = await Transaction.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
+        if(txn && req.body.status === 'Verified' && txn.type === 'driver_subscription') {
+            await User.findByIdAndUpdate(txn.user_id, { is_subscribed: true });
+        }
+        res.json(txn);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 7. RIDES
 app.post('/api/rides', async (req, res) => {
-    const driver = await User.findById(req.body.driver_id);
-    if(driver.status !== 'verified') return res.status(403).json({ error: "Not Verified" });
-    if(driver.trip_count >= 5 && !driver.is_subscribed) return res.status(403).json({ error: "Limit Reached" });
-    
-    const ride = new Ride({ ...req.body, driver_name: driver.name });
-    await ride.save();
-    await User.findByIdAndUpdate(req.body.driver_id, { $inc: { trip_count: 1 } });
-    res.json(ride);
+    try {
+        const driver = await User.findById(req.body.driver_id);
+        if(driver.status !== 'verified') return res.status(403).json({ error: "Not Verified" });
+        if(driver.trip_count >= 5 && !driver.is_subscribed) return res.status(403).json({ error: "Limit Reached" });
+        
+        const ride = new Ride({ ...req.body, driver_name: driver.name });
+        await ride.save();
+        await User.findByIdAndUpdate(req.body.driver_id, { $inc: { trip_count: 1 } });
+        res.json(ride);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/rides', async (req, res) => {
-    const rides = await Ride.find({ is_active: true });
-    res.json(rides);
+    try {
+        const rides = await Ride.find({ is_active: true });
+        res.json(rides);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 8. SETTINGS
 app.get('/api/settings', async (req, res) => {
-    const s = await Settings.findOne();
-    res.json(s);
+    try {
+        const s = await Settings.findOne();
+        res.json(s);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/admin/settings', async (req, res) => {
-    const s = await Settings.findOneAndUpdate({}, req.body, { new: true, upsert: true });
-    res.json(s);
+    try {
+        const s = await Settings.findOneAndUpdate({}, req.body, { new: true, upsert: true });
+        res.json(s);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 9. SUPER ADMIN SEED
+// 9. SEEDING
 async function seedSuperAdmin() {
     const exists = await User.findOne({ email: 'royric93@gmail.com' });
     if (!exists) {
@@ -316,22 +330,24 @@ async function seedSuperAdmin() {
 
 async function seedDefaultSettings() {
     const exists = await Settings.findOne();
-    if (!exists) await new Settings({}).save();
+    if (!sexists) await new sSettings({}).save();
 }
 
 app.post('/api/admin/create-admin', async (req, res) => {
-    const creator = await User.findById(req.body.creatorId);
-    if (!creator || creator.role !== 'super-admin') return res.status(403).json({ error: "Unauthorized" });
-    
-    const newAdmin = new User({ 
-        role: 'admin', 
-        email: req.body.newEmail, 
-        password: req.body.newPassword, 
-        name: req.body.newName, 
-        status: 'verified' 
-    });
-    await newAdmin.save();
-    res.json({ message: "Admin Created" });
+    try {
+        const creator = await User.findById(req.body.creatorId);
+        if (!creator || creator.role !== 'super-admin') return res.status(403).json({ error: "Unauthorized" });
+        
+        const newAdmin = new User({ 
+            role: 'admin', 
+            email: req.body.newEmail, 
+            password: req.body.newPassword, 
+            name: req.body.newName, 
+            status: 'verified' 
+        });
+        await newAdmin.save();
+        res.json({ message: "Admin Created" });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
-ss
+
 app.listen(PORT, () => console.log(`🚀 RipeRide Server running on Port ${PORT}`));
