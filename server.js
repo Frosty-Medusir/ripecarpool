@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto'); // Required for OTP hashing
 
 // --- CONFIGURATION ---
 try { require('dotenv').config(); } catch (e) { console.log("⚠️ dotenv not found."); }
@@ -23,9 +24,11 @@ mongoose.connect(dbURI, { useNewUrlParser: true, useUnifiedTopology: true })
     })
     .catch(err => console.log("❌ MongoDB Error:", err));
 
-// --- EMAIL CONFIGURATION ---
+// --- EMAIL CONFIGURATION (FIXED FOR RENDER) ---
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true, // Use SSL to prevent connection errors
     auth: { 
         user: process.env.EMAIL_USER || 'royric93@gmail.com', 
         pass: process.env.EMAIL_PASS || 'dath hebl ibih dtzk' 
@@ -36,7 +39,7 @@ async function sendNotification(email, subject, text) {
     try { 
         console.log(`📨 Sending email to ${email}...`);
         await transporter.sendMail({ 
-            from: '"RipeRide Security" <royric93@gmail.com>', // App Name: RipeRide
+            from: '"RipeRide Security" <royric93@gmail.com>', 
             to: email, 
             subject: subject, 
             text: text 
@@ -99,6 +102,76 @@ const Transaction = mongoose.model('Transaction', TransactionSchema);
 const Settings = mongoose.model('Settings', SettingsSchema);
 
 // --- ROUTES ---
+
+// 1. PASSWORD RESET FLOW
+
+// Step A: Request OTP
+app.post('/api/auth/forgot-password', async (req, res) => {
+    try {
+        const { email } = req.body;
+        const user = await User.findOne({ email });
+        if (!user) return res.status(404).json({ error: "Email not found" });
+
+        // Generate 6-digit OTP
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const hash = crypto.createHash('sha256').update(otp).digest('hex');
+
+        // Save Hash + Expiry (15 mins)
+        user.otpHash = hash;
+        user.otpExpires = Date.now() + 15 * 60 * 1000; 
+        await user.save();
+
+        // Send Email
+        await sendNotification(email, "Your RipeRide Reset Code", `Your Verification Code is: ${otp}\n\nThis code expires in 15 minutes.`);
+        
+        res.json({ message: "OTP Sent" });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Step B: Verify OTP
+app.post('/api/auth/verify-otp', async (req, res) => {
+    try {
+        const { email, otp } = req.body;
+        const user = await User.findOne({ email });
+        if (!user) return res.status(404).json({ error: "User not found" });
+
+        if (!user.otpExpires || Date.now() > user.otpExpires) {
+            return res.status(400).json({ error: "OTP has expired." });
+        }
+        
+        const hash = crypto.createHash('sha256').update(otp).digest('hex');
+        if (hash !== user.otpHash) {
+            return res.status(400).json({ error: "Invalid Code." });
+        }
+
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        user.resetToken = resetToken;
+        user.otpHash = undefined;
+        user.otpExpires = undefined;
+        await user.save();
+
+        res.json({ message: "Verified", token: resetToken });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Step C: Reset Password
+app.post('/api/auth/reset-password', async (req, res) => {
+    try {
+        const { email, newPassword, token } = req.body;
+        const user = await User.findOne({ email });
+        
+        if (!user || !user.resetToken || user.resetToken !== token) {
+            return res.status(403).json({ error: "Invalid session." });
+        }
+
+        user.password = newPassword; 
+        user.resetToken = undefined; 
+        await user.save();
+
+        await sendNotification(email, "Password Changed", "Your RipeRide password has been updated.");
+        res.json({ message: "Password updated" });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // AUTH
 app.post('/api/auth/signup', async (req, res) => {
