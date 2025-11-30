@@ -103,7 +103,17 @@ const Settings = mongoose.model('Settings', SettingsSchema);
 
 // --- ROUTES ---
 
-// 1. ADMIN: DELETE ALL USERS (Danger Zone)
+// 1. USER DATA REFRESH (NEW ENDPOINT)
+// This allows the frontend to fetch the latest status without re-logging in
+app.get('/api/user/:id', async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ error: "User not found" });
+        res.json(user);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 2. ADMIN: DELETE ALL USERS (Danger Zone)
 app.delete('/api/admin/users', async (req, res) => {
     try {
         await User.deleteMany({ role: { $in: ['passenger', 'driver'] } });
@@ -115,7 +125,7 @@ app.delete('/api/admin/users', async (req, res) => {
     }
 });
 
-// 2. PASSWORD RESET FLOW
+// 3. PASSWORD RESET FLOW
 app.post('/api/auth/forgot-password', async (req, res) => {
     try {
         const { email } = req.body;
@@ -182,7 +192,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. AUTH & SIGNUP
+// 4. AUTH & SIGNUP
 app.post('/api/auth/signup', async (req, res) => {
     try {
         if (req.body.role.includes('admin')) return res.status(403).json({ error: "Restricted" });
@@ -205,7 +215,7 @@ app.post('/api/auth/login', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 4. DOC UPLOADS
+// 5. DOC UPLOADS
 app.post('/api/driver/upload-docs', async (req, res) => {
     try {
         const { userId, idPhoto, idBackPhoto, dlPhoto, platePhoto, holdingPhoto, profilePhoto } = req.body;
@@ -230,7 +240,7 @@ app.post('/api/passenger/upload-docs', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 5. PAYMENTS
+// 6. PAYMENTS
 app.post('/api/pay', async (req, res) => {
     try {
         const txn = new Transaction({ ...req.body, status: 'Pending' });
@@ -239,7 +249,7 @@ app.post('/api/pay', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 6. ADMIN ROUTES
+// 7. ADMIN ROUTES
 app.get('/api/admin/pending-users', async (req, res) => {
     try {
         const users = await User.find({ status: 'pending' });
@@ -280,7 +290,7 @@ app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 7. RIDES
+// 8. RIDES
 app.post('/api/rides', async (req, res) => {
     try {
         const driver = await User.findById(req.body.driver_id);
@@ -301,7 +311,7 @@ app.get('/api/rides', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 8. SETTINGS
+// 9. SETTINGS
 app.get('/api/settings', async (req, res) => {
     try {
         const s = await Settings.findOne();
@@ -316,7 +326,7 @@ app.post('/api/admin/settings', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 9. SEEDING
+// 10. SEEDING
 async function seedSuperAdmin() {
     try {
         const exists = await User.findOne({ email: 'royric93@gmail.com' });
