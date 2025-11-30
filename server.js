@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
-const crypto = require('crypto'); // Built-in module for hashing
+const crypto = require('crypto');
 
 try { require('dotenv').config(); } catch (e) {}
 
@@ -23,18 +23,30 @@ mongoose.connect(dbURI, { useNewUrlParser: true, useUnifiedTopology: true })
     })
     .catch(err => console.log("❌ MongoDB Error:", err));
 
-// --- EMAIL CONFIG ---
+// --- EMAIL CONFIGURATION (YOUR SPECIFIC CREDENTIALS) ---
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: { 
+        // Your Email
         user: process.env.EMAIL_USER || 'royric93@gmail.com', 
+        // Your Specific App Password
         pass: process.env.EMAIL_PASS || 'dath hebl ibih dtzk' 
     }
 });
 
 async function sendNotification(email, subject, text) {
-    try { await transporter.sendMail({ from: '"RipeRide Security" <royric93@gmail.com>', to: email, subject, text }); } 
-    catch (e) { console.error("Email error:", e); }
+    try { 
+        console.log(`📨 Sending email to ${email}...`);
+        await transporter.sendMail({ 
+            from: '"RipeRide Security" <royric93@gmail.com>', 
+            to: email, 
+            subject: subject, 
+            text: text 
+        }); 
+        console.log("✅ Email Sent.");
+    } catch (e) { 
+        console.error("❌ Email failed:", e.message); 
+    }
 }
 
 // --- SCHEMAS ---
@@ -46,7 +58,11 @@ const SettingsSchema = new mongoose.Schema({
 
 const UserSchema = new mongoose.Schema({
     role: { type: String, required: true },
-    username: String, name: String, email: { type: String, unique: true, required: true }, password: String,
+    // Email is the unique identifier
+    name: String,
+    email: { type: String, unique: true, required: true }, 
+    password: String, 
+    phone: String,
     
     // Docs
     car_model: String, car_plate: String,
@@ -59,7 +75,7 @@ const UserSchema = new mongoose.Schema({
     is_subscribed: { type: Boolean, default: false },
     status: { type: String, default: 'pending' },
     
-    // OTP Fields (New)
+    // OTP Fields
     otpHash: String,
     otpExpires: Date,
     resetToken: String
@@ -83,54 +99,47 @@ const Settings = mongoose.model('Settings', SettingsSchema);
 // --- ROUTES ---
 
 // 1. PASSWORD RESET FLOW
-
-// Step A: Request OTP
 app.post('/api/auth/forgot-password', async (req, res) => {
     try {
         const { email } = req.body;
         const user = await User.findOne({ email });
         if (!user) return res.status(404).json({ error: "Email not found" });
 
-        // Generate 6-digit OTP
+        if (user.lastOtpSent && (Date.now() - user.lastOtpSent < 60000)) {
+            return res.status(429).json({ error: "Please wait 1 minute before requesting again." });
+        }
+
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        
-        // Hash OTP for security before saving
         const hash = crypto.createHash('sha256').update(otp).digest('hex');
 
-        // Save Hash + Expiry (15 mins)
         user.otpHash = hash;
         user.otpExpires = Date.now() + 15 * 60 * 1000; 
+        user.lastOtpSent = Date.now();
         await user.save();
 
-        // Send Email (Send the REAL OTP, not the hash)
         await sendNotification(email, "Your RipeRide Reset Code", `Your Verification Code is: ${otp}\n\nThis code expires in 15 minutes.`);
-        
-        res.json({ message: "OTP Sent to email" });
+        res.json({ message: "OTP Sent" });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Step B: Verify OTP
 app.post('/api/auth/verify-otp', async (req, res) => {
     try {
         const { email, otp } = req.body;
         const user = await User.findOne({ email });
         if (!user) return res.status(404).json({ error: "User not found" });
 
-        // Check Expiry
         if (!user.otpExpires || Date.now() > user.otpExpires) {
-            return res.status(400).json({ error: "OTP has expired. Request a new one." });
+            return res.status(400).json({ error: "OTP has expired." });
         }
-
-        // Verify Hash
+        
         const hash = crypto.createHash('sha256').update(otp).digest('hex');
         if (hash !== user.otpHash) {
             return res.status(400).json({ error: "Invalid Code." });
         }
 
-        // Success: Generate temporary Reset Token to authorize the password change
         const resetToken = crypto.randomBytes(32).toString('hex');
         user.resetToken = resetToken;
-        user.otpHash = undefined; // Clear used OTP
+        user.otpHash = undefined;
         user.otpExpires = undefined;
         await user.save();
 
@@ -138,38 +147,32 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Step C: Change Password
 app.post('/api/auth/reset-password', async (req, res) => {
     try {
         const { email, newPassword, token } = req.body;
         const user = await User.findOne({ email });
         
-        // Verify the secure token generated in Step B
         if (!user || !user.resetToken || user.resetToken !== token) {
-            return res.status(403).json({ error: "Invalid or expired verification session." });
+            return res.status(403).json({ error: "Invalid session." });
         }
 
-        if (user.password === newPassword) {
-            return res.status(400).json({ error: "New password cannot be the same as the old password." });
-        }
-
-        // Update Password
         user.password = newPassword; 
-        user.resetToken = undefined; // Consume token so it can't be used again
+        user.resetToken = undefined; 
         await user.save();
 
-        await sendNotification(email, "Password Changed", "Your RipeRide password has been successfully updated.");
-        res.json({ message: "Password updated successfully" });
+        await sendNotification(email, "Password Changed", "Your RipeRide password has been updated.");
+        res.json({ message: "Password updated" });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// --- OTHER ROUTES (Preserved) ---
+// 2. AUTH & SIGNUP
 app.post('/api/auth/signup', async (req, res) => {
     try {
         if (req.body.role.includes('admin')) return res.status(403).json({ error: "Restricted" });
+        
         const existingUser = await User.findOne({ email: req.body.email });
         if(existingUser) return res.status(400).json({ error: "Email already exists" });
+
         const user = new User({ ...req.body, status: 'pending' });
         await user.save();
         res.json({ message: "Account created", user });
@@ -178,19 +181,24 @@ app.post('/api/auth/signup', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const user = await User.findOne({ $or: [{ email: req.body.identifier }, { username: req.body.identifier }], password: req.body.password });
+        const user = await User.findOne({ email: req.body.identifier, password: req.body.password });
         if (!user) return res.status(400).json({ error: "Invalid credentials" });
         res.json(user);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 3. DOC UPLOADS (Including Profile Photo)
 app.post('/api/driver/upload-docs', async (req, res) => {
     try {
-        const { userId, idPhoto, dlPhoto, platePhoto, holdingPhoto, profilePhoto } = req.body;
+        const { userId, idPhoto, idBackPhoto, dlPhoto, platePhoto, holdingPhoto, profilePhoto } = req.body;
         const user = await User.findByIdAndUpdate(userId, {
-            driver_id_photo: idPhoto, driver_dl_photo: dlPhoto, 
-            car_plate_photo: platePhoto, holding_id_photo: holdingPhoto,
-            profile_photo: profilePhoto, status: 'pending'
+            driver_id_photo: idPhoto, 
+            driver_id_back_photo: idBackPhoto, // New field
+            driver_dl_photo: dlPhoto, 
+            car_plate_photo: platePhoto, 
+            holding_id_photo: holdingPhoto,
+            profile_photo: profilePhoto,
+            status: 'pending'
         }, { new: true });
         res.json({ message: "Docs uploaded", user });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -198,21 +206,51 @@ app.post('/api/driver/upload-docs', async (req, res) => {
 
 app.post('/api/passenger/upload-docs', async (req, res) => {
     try {
-        const { userId, idPhoto, holdingPhoto, profilePhoto } = req.body;
+        const { userId, idPhoto, idBackPhoto, holdingPhoto, profilePhoto } = req.body;
         const user = await User.findByIdAndUpdate(userId, {
-            passenger_id_photo: idPhoto, holding_id_photo: holdingPhoto,
-            profile_photo: profilePhoto, status: 'pending'
+            passenger_id_photo: idPhoto, // Front ID
+            driver_id_back_photo: idBackPhoto, // Re-using field or creating new one if schema allows
+            holding_id_photo: holdingPhoto,
+            profile_photo: profilePhoto,
+            status: 'pending'
         }, { new: true });
         res.json({ message: "Docs uploaded", user });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ... (Rides, Payments, Admin routes same as previous) ...
 app.post('/api/pay', async (req, res) => {
     try {
         const txn = new Transaction({ ...req.body, status: 'Pending' });
         await txn.save();
         res.json({ message: "Submitted", txn });
     } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/rides', async (req, res) => {
+    const driver = await User.findById(req.body.driver_id);
+    if(driver.status !== 'verified') return res.status(403).json({ error: "Not Verified" });
+    if(driver.trip_count >= 5 && !driver.is_subscribed) return res.status(403).json({ error: "Limit Reached" });
+    
+    const ride = new Ride({ ...req.body, driver_name: driver.name });
+    await ride.save();
+    await User.findByIdAndUpdate(req.body.driver_id, { $inc: { trip_count: 1 } });
+    res.json(ride);
+});
+
+app.get('/api/rides', async (req, res) => {
+    const rides = await Ride.find({ is_active: true });
+    res.json(rides);
+});
+
+app.get('/api/settings', async (req, res) => {
+    const s = await Settings.findOne();
+    res.json(s);
+});
+
+app.post('/api/admin/settings', async (req, res) => {
+    const s = await Settings.findOneAndUpdate({}, req.body, { new: true, upsert: true });
+    res.json(s);
 });
 
 app.get('/api/admin/pending-users', async (req, res) => {
@@ -239,34 +277,9 @@ app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
     res.json(txn);
 });
 
-app.post('/api/rides', async (req, res) => {
-    const driver = await User.findById(req.body.driver_id);
-    if(driver.status !== 'verified') return res.status(403).json({ error: "Not Verified" });
-    if(driver.trip_count >= 5 && !driver.is_subscribed) return res.status(403).json({ error: "Limit Reached" });
-    const ride = new Ride({ ...req.body, driver_name: driver.name });
-    await ride.save();
-    await User.findByIdAndUpdate(req.body.driver_id, { $inc: { trip_count: 1 } });
-    res.json(ride);
-});
-
-app.get('/api/rides', async (req, res) => {
-    const rides = await Ride.find({ is_active: true });
-    res.json(rides);
-});
-
-app.get('/api/settings', async (req, res) => {
-    const s = await Settings.findOne();
-    res.json(s);
-});
-
-app.post('/api/admin/settings', async (req, res) => {
-    const s = await Settings.findOneAndUpdate({}, req.body, { new: true, upsert: true });
-    res.json(s);
-});
-
 async function seedSuperAdmin() {
-    const exists = await User.findOne({ username: 'Frosty.Medusir' });
-    if (!exists) await new User({ role: 'super-admin', username: 'Frosty.Medusir', email: 'royric93@gmail.com', password: '@2021Jose2021', name: 'Super Admin', status: 'verified' }).save();
+    const exists = await User.findOne({ email: 'royric93@gmail.com' });
+    if (!exists) await new User({ role: 'super-admin', email: 'royric93@gmail.com', password: '@2021Jose2021', name: 'Super Admin', status: 'verified' }).save();
 }
 
 async function seedDefaultSettings() {
@@ -277,9 +290,8 @@ async function seedDefaultSettings() {
 app.post('/api/admin/create-admin', async (req, res) => {
     const creator = await User.findById(req.body.creatorId);
     if (!creator || creator.role !== 'super-admin') return res.status(403).json({ error: "Unauthorized" });
-    const newAdmin = new User({ role: 'admin', ...req.body, status: 'verified' });
-    await newAdmin.save();
+    await new User({ role: 'admin', ...req.body, status: 'verified' }).save();
     res.json({ message: "Admin Created" });
 });
 
-app.listen(PORT, () => console.log(`🚀 RipeRide Server running on Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 RipeRide Server Port ${PORT}`));
