@@ -46,7 +46,7 @@ const SettingsSchema = new mongoose.Schema({
 const UserSchema = new mongoose.Schema({
     role: { type: String, required: true },
     username: String, name: String, email: { type: String, unique: true, required: true }, password: String,
-    phone: String, // Updated via KYC for passengers
+    phone: String, 
     
     // Docs
     car_model: String, car_plate: String,
@@ -60,26 +60,21 @@ const UserSchema = new mongoose.Schema({
 });
 
 const TransactionSchema = new mongoose.Schema({
-    code: String, 
-    user_id: String, 
-    user_name: String, 
-    type: String, // 'unlock_contact', 'driver_subscription'
-    amount: Number,
-    ride_id: String, // NEW: Links payment to a ride
-    status: { type: String, default: 'Pending' }, 
-    date: { type: Date, default: Date.now }
+    code: String, user_id: String, user_name: String, type: String, amount: Number,
+    ride_id: String,
+    status: { type: String, default: 'Pending' }, date: { type: Date, default: Date.now }
 });
 
 const RideSchema = new mongoose.Schema({
-    driver_id: String, 
+    driver_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // Ref to User for population
     driver_name: String, 
     origin: String, 
     destination: String, 
     date: Date, 
     price: Number, 
-    seats: Number, // Available seats
-    contacts: { main: String, alt: String }, // NEW: Driver contacts
-    passengers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }], // NEW: Confirmed passengers
+    seats: Number,
+    contacts: { main: String, alt: String },
+    passengers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }], // List of passengers
     is_active: { type: Boolean, default: true }
 });
 
@@ -111,26 +106,11 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/user/:id', async (req, res) => {
     try {
         const user = await User.findById(req.params.id);
-        if (!user) return res.status(404).json({ error: "User not found" });
         res.json(user);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PASSENGER UPLOAD (Includes Phone Number)
-app.post('/api/passenger/upload-docs', async (req, res) => {
-    try {
-        const { userId, idPhoto, idBackPhoto, holdingPhoto, profilePhoto, phone } = req.body;
-        const user = await User.findByIdAndUpdate(userId, {
-            passenger_id_photo: idPhoto, passenger_id_back_photo: idBackPhoto,
-            holding_id_photo: holdingPhoto, profile_photo: profilePhoto,
-            phone: phone, // Update phone
-            status: 'pending'
-        }, { new: true });
-        res.json({ message: "Docs uploaded", user });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// DRIVER UPLOAD
+// DOC UPLOADS
 app.post('/api/driver/upload-docs', async (req, res) => {
     try {
         const { userId, idPhoto, idBackPhoto, dlPhoto, platePhoto, holdingPhoto, profilePhoto } = req.body;
@@ -138,6 +118,18 @@ app.post('/api/driver/upload-docs', async (req, res) => {
             driver_id_photo: idPhoto, driver_id_back_photo: idBackPhoto,
             driver_dl_photo: dlPhoto, car_plate_photo: platePhoto, holding_id_photo: holdingPhoto,
             profile_photo: profilePhoto, status: 'pending'
+        }, { new: true });
+        res.json({ message: "Docs uploaded", user });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/passenger/upload-docs', async (req, res) => {
+    try {
+        const { userId, idPhoto, idBackPhoto, holdingPhoto, profilePhoto, phone } = req.body;
+        const user = await User.findByIdAndUpdate(userId, {
+            passenger_id_photo: idPhoto, passenger_id_back_photo: idBackPhoto,
+            holding_id_photo: holdingPhoto, profile_photo: profilePhoto, phone: phone,
+            status: 'pending'
         }, { new: true });
         res.json({ message: "Docs uploaded", user });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -153,8 +145,7 @@ app.post('/api/rides', async (req, res) => {
         const ride = new Ride({ 
             ...req.body, 
             driver_name: driver.name,
-            // Contacts stored in ride for privacy control
-            contacts: { main: req.body.main_contact, alt: req.body.alt_contact } 
+            contacts: { main: req.body.main_contact, alt: req.body.alt_contact }
         });
         await ride.save();
         await User.findByIdAndUpdate(req.body.driver_id, { $inc: { trip_count: 1 } });
@@ -162,32 +153,29 @@ app.post('/api/rides', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get Active Rides (Modified: Hides fully booked rides unless current user is booked)
 app.get('/api/rides', async (req, res) => {
-    try {
-        const rides = await Ride.find({ is_active: true });
-        // Filter logic (e.g. seats > 0) is best done on frontend or query params if simple
-        // We send all active rides, frontend filters based on seats or user booking
-        res.json(rides);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    const rides = await Ride.find({ is_active: true, seats: { $gt: 0 } }); // Only show active with seats
+    res.json(rides);
 });
 
-// Get Driver's Specific Rides (with Passenger Details)
+// GET RIDES FOR DRIVER (With Passenger Info)
 app.get('/api/driver/:id/rides', async (req, res) => {
     try {
+        // Populate passengers to get their profiles
         const rides = await Ride.find({ driver_id: req.params.id }).populate('passengers', 'name phone profile_photo email');
         res.json(rides);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get Passenger's Booked Rides (For unlocking numbers)
-app.get('/api/passenger/:id/bookings', async (req, res) => {
+// GET BOOKINGS FOR PASSENGER (With Driver Info)
+app.get('/api/passenger/:id/rides', async (req, res) => {
     try {
-        // Find rides where this passenger ID exists in the passengers array
-        const rides = await Ride.find({ passengers: req.params.id });
+        // Find rides where this passenger is listed, populate driver info
+        const rides = await Ride.find({ passengers: req.params.id }).populate('driver_id', 'name phone profile_photo car_model car_plate');
         res.json(rides);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 
 // PAYMENTS
 app.post('/api/pay', async (req, res) => {
@@ -198,63 +186,57 @@ app.post('/api/pay', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ADMIN VERIFY TRANSACTION (Updated Logic)
-app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
-    try {
-        const txn = await Transaction.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
-        
-        if(req.body.status === 'Verified') {
-            // 1. Handle Driver Subscription
-            if(txn.type === 'driver_subscription') {
-                await User.findByIdAndUpdate(txn.user_id, { is_subscribed: true });
-            } 
-            // 2. Handle Ride Unlock
-            else if(txn.type === 'unlock_contact' && txn.ride_id) {
-                // Add passenger to ride and decrement seats
-                const ride = await Ride.findById(txn.ride_id);
-                if(ride && ride.seats > 0) {
-                    ride.passengers.push(txn.user_id);
-                    ride.seats = ride.seats - 1;
-                    if(ride.seats <= 0) ride.is_active = false; // Hide from others if full? Or just keep active with 0 seats
-                    await ride.save();
-                    
-                    // Fetch User for email
-                    const user = await User.findById(txn.user_id);
-                    sendNotification(user.email, "Ride Unlocked!", `You have successfully booked the ride. \nDriver Main: ${ride.contacts.main}\nAlt: ${ride.contacts.alt}`);
-                }
-            }
-        }
-        res.json(txn);
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ADMIN GENERIC ROUTES
+// ADMIN
 app.get('/api/admin/pending-users', async (req, res) => {
     const users = await User.find({ status: 'pending' });
     res.json(users);
 });
+
 app.patch('/api/admin/verify-user/:id', async (req, res) => {
-    await User.findByIdAndUpdate(req.params.id, { status: 'verified' });
+    const user = await User.findByIdAndUpdate(req.params.id, { status: 'verified' }, { new: true });
+    sendNotification(user.email, "Verified!", "Your RipeRide account is verified.");
     res.json({ success: true });
 });
+
 app.patch('/api/admin/reject-user/:id', async (req, res) => {
-    await User.findByIdAndUpdate(req.params.id, { status: 'rejected' });
+    const user = await User.findByIdAndUpdate(req.params.id, { status: 'rejected' }, { new: true });
+    sendNotification(user.email, "Verification Failed", "Documents rejected. Please re-upload.");
     res.json({ success: true });
 });
+
 app.get('/api/admin/transactions', async (req, res) => {
     const txns = await Transaction.find({ status: 'Pending' });
     res.json(txns);
 });
+
+app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
+    const txn = await Transaction.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
+    
+    if(req.body.status === 'Verified') {
+        if(txn.type === 'driver_subscription') {
+            await User.findByIdAndUpdate(txn.user_id, { is_subscribed: true });
+        } else if (txn.type === 'unlock_contact' && txn.ride_id) {
+            // Add passenger to ride
+            await Ride.findByIdAndUpdate(txn.ride_id, { 
+                $addToSet: { passengers: txn.user_id },
+                $inc: { seats: -1 }
+            });
+        }
+    }
+    res.json(txn);
+});
+
+// SETTINGS
 app.get('/api/settings', async (req, res) => {
     const s = await Settings.findOne();
     res.json(s);
 });
+
 app.post('/api/admin/settings', async (req, res) => {
     const s = await Settings.findOneAndUpdate({}, req.body, { new: true, upsert: true });
     res.json(s);
 });
 
-// SEEDING & ADMIN CREATE
 async function seedSuperAdmin() {
     const exists = await User.findOne({ email: 'royric93@gmail.com' });
     if (!exists) await new User({ role: 'super-admin', email: 'royric93@gmail.com', password: '@2021Jose2021', name: 'Super Admin', status: 'verified' }).save();
@@ -263,6 +245,7 @@ async function seedDefaultSettings() {
     const exists = await Settings.findOne();
     if (!exists) await new Settings({}).save();
 }
+
 app.post('/api/admin/create-admin', async (req, res) => {
     const creator = await User.findById(req.body.creatorId);
     if (!creator || creator.role !== 'super-admin') return res.status(403).json({ error: "Unauthorized" });
@@ -270,4 +253,4 @@ app.post('/api/admin/create-admin', async (req, res) => {
     res.json({ message: "Admin Created" });
 });
 
-app.listen(PORT, () => console.log(`🚀 RipeRide Server Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 RipeRide Server running on Port ${PORT}`));
