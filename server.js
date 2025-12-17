@@ -4,36 +4,45 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
+const path = require('path');
 
-try { require('dotenv').config(); } catch (e) { console.log("⚠️ dotenv not found."); }
+// --- LOAD ENV VARS ---
+try {
+    require('dotenv').config();
+    if (!process.env.MONGO_URI) {
+        require('dotenv').config({ path: path.join(__dirname, '.env') });
+    }
+} catch (e) {
+    console.log("⚠️  dotenv loading error:", e.message);
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' })); // Large limit for images
+app.use(bodyParser.json({ limit: '50mb' }));
 
-// --- DATABASE CONNECTION ---
+// --- DATABASE CONNECTION (SECURED) ---
 const dbURI = process.env.MONGO_URI;
 
 if (!dbURI) {
-    console.error("❌ FATAL ERROR: MONGO_URI is not defined. Check your .env file or Render Dashboard.");
-    process.exit(1);
+    console.error("❌ FATAL ERROR: MONGO_URI is missing. Check Render Environment Variables.");
+    // We do not exit process here to allow debugging, but DB features will fail.
+} else {
+    mongoose.connect(dbURI, { useNewUrlParser: true, useUnifiedTopology: true })
+        .then(async () => { 
+            console.log("✅ MongoDB Connected"); 
+            await seedSuperAdmin();
+            await seedDefaultSettings();
+        })
+        .catch(err => console.log("❌ MongoDB Error:", err));
 }
 
-mongoose.connect(dbURI, { useNewUrlParser: true, useUnifiedTopology: true })
-    .then(async () => { 
-        console.log("✅ MongoDB Connected"); 
-        await seedSuperAdmin();
-        await seedDefaultSettings();
-    })
-    .catch(err => console.log("❌ MongoDB Error:", err));
-
-// --- EMAIL CONFIGURATION ---
+// --- EMAIL CONFIGURATION (SECURED) ---
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 465,
-    secure: true, 
+    secure: true,
     auth: { 
         user: process.env.EMAIL_USER, 
         pass: process.env.EMAIL_PASS 
@@ -42,17 +51,24 @@ const transporter = nodemailer.createTransport({
 });
 
 async function sendNotification(email, subject, text) {
+    // Security Check: Ensure env vars are loaded
     if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-        console.log("⚠️ Email credentials missing. Skipping email.");
+        console.warn("⚠️  Email credentials missing in Environment Variables. Email not sent.");
         return;
     }
 
     try { 
         console.log(`📨 Sending email to ${email}...`);
-        await transporter.sendMail({ from: '"RipeRide Security" <' + process.env.EMAIL_USER + '>', to: email, subject, text }); 
-        console.log("✅ Email Sent successfully.");
-    } 
-    catch (e) { console.error("❌ Email error:", e.message); }
+        const info = await transporter.sendMail({ 
+            from: `"RipeRide Security" <${process.env.EMAIL_USER}>`, 
+            to: email, 
+            subject: subject, 
+            text: text 
+        }); 
+        console.log("✅ Email Sent. MessageID:", info.messageId);
+    } catch (e) { 
+        console.error("❌ Email Failed:", e.code || e.message); 
+    }
 }
 
 // --- SCHEMAS ---
@@ -70,27 +86,16 @@ const UserSchema = new mongoose.Schema({
     password: String, 
     phone: String,
     
-    // Driver Details
-    car_model: String, 
-    car_plate: String, 
-    car_color: String,
+    // Docs
+    car_model: String, car_plate: String, car_color: String,
+    driver_id_photo: String, driver_id_back_photo: String, driver_dl_photo: String, car_plate_photo: String, driver_selfie: String,
     
-    // Documents
-    driver_id_photo: String, 
-    driver_id_back_photo: String,
-    driver_dl_photo: String, 
-    car_plate_photo: String, 
-    driver_selfie: String,
+    passenger_id_photo: String, passenger_id_back_photo: String,
     
-    // Passenger Documents
-    passenger_id_photo: String, 
-    passenger_id_back_photo: String,
-    
-    // Shared Documents
     holding_id_photo: String,
     profile_photo: String,
     
-    // Profile & Preferences
+    // Bio
     bio: String,
     preferences: {
         chat: { type: String, default: "Depends" },
@@ -99,16 +104,11 @@ const UserSchema = new mongoose.Schema({
         pets: { type: String, default: "No" }
     },
     
-    // Logic
     trip_count: { type: Number, default: 0 },
     is_subscribed: { type: Boolean, default: false },
     status: { type: String, default: 'pending' },
     
-    // Security
-    otpHash: String,
-    otpExpires: Date,
-    lastOtpSent: Date,
-    resetToken: String
+    otpHash: String, otpExpires: Date, lastOtpSent: Date, resetToken: String
 });
 
 const TransactionSchema = new mongoose.Schema({
@@ -119,16 +119,13 @@ const TransactionSchema = new mongoose.Schema({
 const RideSchema = new mongoose.Schema({
     driver_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     driver_name: String, 
-    origin: String, 
-    destination: String, 
-    date: Date, 
-    time: String, 
-    duration: String, 
-    price: Number, 
-    seats: Number,
+    origin: String, destination: String, 
+    date: Date, time: String, duration: String, price: Number, seats: Number,
     contacts: { main: String, alt: String },
     passengers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
-    is_active: { type: Boolean, default: true }
+    is_active: { type: Boolean, default: true },
+    sos_alert: { type: Boolean, default: false },
+    location: { lat: Number, lng: Number }
 });
 
 const User = mongoose.model('User', UserSchema);
@@ -138,12 +135,7 @@ const Settings = mongoose.model('Settings', SettingsSchema);
 
 // --- ROUTES ---
 
-// 0. HEALTH CHECK (Ping Pong)
-app.get('/ping', (req, res) => {
-    res.status(200).send('pong');
-});
-
-// 1. AUTHENTICATION & PROFILE
+// 1. AUTH
 app.post('/api/auth/signup', async (req, res) => {
     try {
         if (req.body.role.includes('admin')) return res.status(403).json({ error: "Restricted" });
@@ -174,11 +166,11 @@ app.get('/api/user/:id', async (req, res) => {
 app.patch('/api/user/:id/profile', async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.params.id, req.body, { new: true });
-        res.json({ message: "Profile Updated", user });
+        res.json({ message: "Updated", user });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 2. PASSWORD RESET (OTP)
+// 2. OTP & RESET
 app.post('/api/auth/forgot-password', async (req, res) => {
     try {
         const { email } = req.body;
@@ -190,6 +182,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         }
 
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        // Hashing logic recommended for production
         const hash = crypto.createHash('sha256').update(otp).digest('hex');
 
         user.otpHash = hash;
@@ -197,7 +190,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         user.lastOtpSent = Date.now();
         await user.save();
 
-        await sendNotification(email, "RipeRide Reset Code", `Your verification code is: ${otp}\n\nThis code expires in 15 minutes.`);
+        await sendNotification(email, "RipeRide Reset Code", `Your verification code is: ${otp}\n\nExpires in 15 minutes.`);
         res.json({ message: "OTP Sent" });
     } catch (e) { 
         console.error("Forgot Password Error:", e);
@@ -239,11 +232,11 @@ app.post('/api/auth/reset-password', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. DOCUMENTS
+// 3. UPLOADS
 app.post('/api/driver/upload-docs', async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.body.userId, { 
-            ...req.body, status: 'pending' // Reset status to pending on new upload
+            ...req.body, status: 'pending' 
         }, { new: true });
         res.json({ message: "Uploaded", user });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -262,7 +255,6 @@ app.post('/api/passenger/upload-docs', async (req, res) => {
 app.post('/api/rides', async (req, res) => {
     try {
         const driver = await User.findById(req.body.driver_id);
-        if (!driver) return res.status(404).json({ error: "Driver not found" });
         if(driver.status !== 'verified') return res.status(403).json({ error: "Not Verified" });
         if(driver.trip_count >= 5 && !driver.is_subscribed) return res.status(403).json({ error: "Subscription Required" });
         
@@ -294,11 +286,29 @@ app.get('/api/passenger/:id/rides', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Complete Trip Endpoint
 app.patch('/api/rides/:id', async (req, res) => {
     try {
         const ride = await Ride.findByIdAndUpdate(req.params.id, req.body, { new: true });
         res.json(ride);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/rides/:id/sos', async (req, res) => {
+    try {
+        const ride = await Ride.findByIdAndUpdate(req.params.id, { sos_alert: true }, { new: true });
+        // Email Admin for SOS
+        if(process.env.SUPER_ADMIN_EMAIL) {
+            sendNotification(process.env.SUPER_ADMIN_EMAIL, "SOS ALERT!", `SOS triggered for Ride ${ride._id}. Driver: ${ride.driver_name}`);
+        }
+        res.json(ride);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/rides/:id/location', async (req, res) => {
+    try {
+        const { lat, lng } = req.body;
+        await Ride.findByIdAndUpdate(req.params.id, { location: { lat, lng } });
+        res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -335,10 +345,12 @@ app.patch('/api/admin/reject-user/:id', async (req, res) => {
 });
 
 app.delete('/api/admin/users', async (req, res) => {
-    await User.deleteMany({ role: { $in: ['passenger', 'driver'] } });
-    await Ride.deleteMany({});
-    await Transaction.deleteMany({});
-    res.json({ success: true, message: "Database Wiped" });
+    try {
+        await User.deleteMany({ role: { $in: ['passenger', 'driver'] } });
+        await Ride.deleteMany({});
+        await Transaction.deleteMany({});
+        res.json({ success: true, message: "Database Wiped" });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/admin/transactions', async (req, res) => {
@@ -355,7 +367,6 @@ app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
             if(txn.type === 'driver_subscription') await User.findByIdAndUpdate(txn.user_id, { is_subscribed: true });
             else if (txn.type === 'unlock_contact' && txn.ride_id) {
                 await Ride.findByIdAndUpdate(txn.ride_id, { $addToSet: { passengers: txn.user_id }, $inc: { seats: -1 } });
-                // Notify User
                 const u = await User.findById(txn.user_id);
                 if(u) sendNotification(u.email, "Ride Unlocked", "You have booked the ride. View details in 'My Rides'.");
             }
@@ -368,25 +379,26 @@ app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
 app.get('/api/settings', async (req, res) => { const s = await Settings.findOne(); res.json(s); });
 app.post('/api/admin/settings', async (req, res) => { const s = await Settings.findOneAndUpdate({}, req.body, { new: true, upsert: true }); res.json(s); });
 
+// 7. SEEDING (SECURE)
 async function seedSuperAdmin() {
     const adminEmail = process.env.SUPER_ADMIN_EMAIL;
     const adminPass = process.env.SUPER_ADMIN_PASSWORD;
 
-    if (!adminEmail || !adminPass) {
-        console.log("⚠️ SUPER_ADMIN_EMAIL or SUPER_ADMIN_PASSWORD not set. Skipping seeding.");
-        return;
-    }
-
-    const exists = await User.findOne({ email: adminEmail });
-    if (!exists) {
-        await new User({ 
-            role: 'super_admin', 
-            email: adminEmail, 
-            password: adminPass, 
-            name: 'Super Admin', 
-            status: 'verified' 
-        }).save();
-        console.log("🔒 Super Admin Created");
+    // Only seed if env vars exist
+    if (adminEmail && adminPass) {
+        const exists = await User.findOne({ email: adminEmail });
+        if (!exists) {
+            await new User({ 
+                role: 'super_admin',
+                email: adminEmail, 
+                password: adminPass, 
+                name: 'Super Admin', 
+                status: 'verified' 
+            }).save();
+            console.log("🔒 Super Admin Created from ENV");
+        }
+    } else {
+        console.log("ℹ️ No SUPER_ADMIN_EMAIL set. Skipping admin seed.");
     }
 }
 async function seedDefaultSettings() { const e = await Settings.findOne(); if (!e) await new Settings({}).save(); }
