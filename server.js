@@ -21,6 +21,34 @@ try {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// --- SECURITY HEADERS MIDDLEWARE ---
+app.use((req, res, next) => {
+    // Content Security Policy - prevent XSS and injection attacks
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https://medusir-backend.onrender.com");
+    
+    // Prevent MIME sniffing
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    
+    // Clickjacking protection
+    res.setHeader('X-Frame-Options', 'DENY');
+    
+    // XSS Protection (legacy browsers)
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    
+    // HSTS - Force HTTPS
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+    
+    // Referrer policy
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    
+    // Disable cached sensitive data
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    
+    next();
+});
+
 // --- CORS CONFIGURATION (SECURED) ---
 app.use(cors({
     origin: function(origin, callback) {
@@ -35,9 +63,54 @@ app.use(cors({
     },
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token']
 }));
 app.use(bodyParser.json({ limit: '50mb' }));
+
+// --- CSRF TOKEN MIDDLEWARE ---
+// Store CSRF tokens in memory (in production, use Redis)
+const csrfTokens = new Map();
+
+const generateCsrfToken = () => {
+    return crypto.randomBytes(32).toString('hex');
+};
+
+// CSRF token validation middleware
+const validateCsrfToken = (req, res, next) => {
+    // Skip CSRF check for GET requests (they don't change data)
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+        return next();
+    }
+    
+    // Get CSRF token from header
+    const token = req.headers['x-csrf-token'];
+    
+    if (!token) {
+        return res.status(403).json({ error: "CSRF token missing" });
+    }
+    
+    // Validate token exists and hasn't expired (5 hour TTL)
+    if (!csrfTokens.has(token)) {
+        return res.status(403).json({ error: "Invalid CSRF token" });
+    }
+    
+    const tokenData = csrfTokens.get(token);
+    if (Date.now() - tokenData.createdAt > 5 * 60 * 60 * 1000) {
+        csrfTokens.delete(token);
+        return res.status(403).json({ error: "CSRF token expired" });
+    }
+    
+    next();
+};
+
+// Apply CSRF validation to all state-changing requests
+app.use((req, res, next) => {
+    if (['POST', 'PATCH', 'DELETE'].includes(req.method)) {
+        validateCsrfToken(req, res, next);
+    } else {
+        next();
+    }
+});
 
 // --- AUTHENTICATION MIDDLEWARE ---
 const requireAuth = (req, res, next) => {
@@ -52,6 +125,121 @@ const requireAuth = (req, res, next) => {
         return res.status(403).json({ error: "Forbidden: Invalid token" });
     }
 };
+
+// --- AUTHORIZATION MIDDLEWARE ---
+const requireAdmin = (req, res, next) => {
+    if (!req.user || !['admin', 'super_admin'].includes(req.user.role)) {
+        return res.status(403).json({ error: "Forbidden: Admin access required" });
+    }
+    next();
+};
+
+const requireSuperAdmin = (req, res, next) => {
+    if (!req.user || req.user.role !== 'super_admin') {
+        return res.status(403).json({ error: "Forbidden: Super Admin access required" });
+    }
+    next();
+};
+
+const requireDriver = (req, res, next) => {
+    if (!req.user || !['driver', 'admin', 'super_admin'].includes(req.user.role)) {
+        return res.status(403).json({ error: "Forbidden: Driver access required" });
+    }
+    next();
+};
+
+const requireOwnerOrAdmin = (req, res, next) => {
+    const targetUserId = req.params.id;
+    const isOwner = req.user.userId === targetUserId;
+    const isAdmin = ['admin', 'super_admin'].includes(req.user.role);
+    
+    if (!isOwner && !isAdmin) {
+        return res.status(403).json({ error: "Forbidden: Can only access your own data" });
+    }
+    next();
+};
+
+// --- PASSWORD VALIDATION ---
+const validatePassword = (password) => {
+    const errors = [];
+    
+    if (password.length < 8) errors.push("Password must be at least 8 characters");
+    if (!/[A-Z]/.test(password)) errors.push("Password must contain uppercase letter");
+    if (!/[a-z]/.test(password)) errors.push("Password must contain lowercase letter");
+    if (!/[0-9]/.test(password)) errors.push("Password must contain number");
+    if (!/[!@#$%^&*]/.test(password)) errors.push("Password must contain special character (!@#$%^&*)");
+    
+    return { valid: errors.length === 0, errors };
+};
+
+// --- DATA TRANSFER OBJECTS (DTOs) ---
+// Remove sensitive data and keep responses lightweight
+
+const userAuthDTO = (user) => ({
+    _id: user._id,
+    email: user.email,
+    role: user.role,
+    name: user.name,
+    status: user.status,
+    profile_photo: user.profile_photo
+});
+
+const userProfileDTO = (user) => ({
+    _id: user._id,
+    email: user.email,
+    name: user.name,
+    phone: user.phone,
+    age: user.age,
+    role: user.role,
+    status: user.status,
+    profile_photo: user.profile_photo,
+    bio: user.bio,
+    preferences: user.preferences,
+    trip_count: user.trip_count,
+    is_subscribed: user.is_subscribed,
+    // Only include car info for drivers
+    ...(user.role === 'driver' && {
+        car_model: user.car_model,
+        car_plate: user.car_plate,
+        car_color: user.car_color
+    })
+});
+
+const driverListingDTO = (user) => ({
+    _id: user._id,
+    name: user.name,
+    age: user.age,
+    profile_photo: user.profile_photo,
+    bio: user.bio,
+    preferences: user.preferences,
+    car_model: user.car_model,
+    car_plate: user.car_plate,
+    car_color: user.car_color,
+    status: user.status
+});
+
+const passengerListingDTO = (user) => ({
+    _id: user._id,
+    name: user.name,
+    profile_photo: user.profile_photo,
+    phone: user.phone,
+    email: user.email
+});
+
+const adminUserDTO = (user) => ({
+    _id: user._id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+    status: user.status,
+    phone: user.phone,
+    age: user.age,
+    profile_photo: user.profile_photo,
+    trip_count: user.trip_count,
+    is_subscribed: user.is_subscribed,
+    created_at: user.createdAt
+});
+
 
 // --- DATABASE CONNECTION (SECURED) ---
 const dbURI = process.env.MONGO_URI;
@@ -166,20 +354,59 @@ const Settings = mongoose.model('Settings', SettingsSchema);
 
 // --- ROUTES ---
 
+// 0. CSRF TOKEN ENDPOINT
+app.post('/api/csrf-token', (req, res) => {
+    const token = generateCsrfToken();
+    csrfTokens.set(token, { createdAt: Date.now() });
+    
+    // Clean up expired tokens (older than 5 hours)
+    for (const [key, value] of csrfTokens.entries()) {
+        if (Date.now() - value.createdAt > 5 * 60 * 60 * 1000) {
+            csrfTokens.delete(key);
+        }
+    }
+    
+    res.json({ csrfToken: token });
+});
+
 // 1. AUTH
 app.post('/api/auth/signup', async (req, res) => {
     try {
-        if (req.body.role.includes('admin')) return res.status(403).json({ error: "Restricted" });
+        // Prevent users from creating admin accounts
+        if (req.body.role && ['admin', 'super_admin'].includes(req.body.role)) {
+            return res.status(403).json({ error: "Cannot create admin account. Contact system administrator." });
+        }
+
+        // Validate password strength
+        const passwordValidation = validatePassword(req.body.password);
+        if (!passwordValidation.valid) {
+            return res.status(400).json({ error: "Weak password", details: passwordValidation.errors });
+        }
+
         const existing = await User.findOne({ email: req.body.email });
         if(existing) return res.status(400).json({ error: "Email already registered." });
 
         // Hash password with bcrypt (salt rounds: 10)
         const hashedPassword = await bcrypt.hash(req.body.password, 10);
+        
+        // Only allow driver or passenger roles
+        const allowedRole = ['driver', 'passenger'].includes(req.body.role) ? req.body.role : 'passenger';
 
-        const user = new User({ ...req.body, password: hashedPassword, status: 'pending' });
-        await user.save();
+        const user = new User({ ...req.body, password: hashedPassword, role: allowedRole, status: 'pending' });
+        const savedUser = await user.save();
 
-        res.json({ message: "Account created", user: { _id: user._id, email: user.email, role: user.role, name: user.name, status: user.status } });
+        // Generate JWT token (24 hour expiry)
+        const token = jwt.sign(
+            { userId: savedUser._id, email: savedUser.email, role: savedUser.role },
+            process.env.JWT_SECRET || 'default-secret-key',
+            { expiresIn: '24h' }
+        );
+
+        // Generate CSRF token for future requests
+        const csrfToken = generateCsrfToken();
+        csrfTokens.set(csrfToken, { createdAt: Date.now() });
+
+        res.json({ message: "Account created", token, csrfToken, user: userAuthDTO(savedUser) });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -199,28 +426,37 @@ app.post('/api/auth/login', async (req, res) => {
             { expiresIn: '24h' }
         );
 
+        // Generate CSRF token for future requests
+        const csrfToken = generateCsrfToken();
+        csrfTokens.set(csrfToken, { createdAt: Date.now() });
+
         // Return only necessary user info (NO password hash)
         res.json({ 
             message: "Login successful", 
             token, 
-            user: { _id: user._id, email: user.email, role: user.role, name: user.name, status: user.status, profile_photo: user.profile_photo }
+            csrfToken,
+            user: userAuthDTO(user)
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/user/:id', requireAuth, async (req, res) => {
+app.get('/api/user/:id', requireAuth, requireOwnerOrAdmin, async (req, res) => {
     try {
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ error: "User not found" });
-        res.json(user);
+        res.json(userProfileDTO(user));
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/user/:id/profile', requireAuth, async (req, res) => {
+app.patch('/api/user/:id/profile', requireAuth, requireOwnerOrAdmin, async (req, res) => {
     try {
+        // Prevent users from changing their own role
+        if (req.body.role && req.body.role !== req.user.role) {
+            return res.status(403).json({ error: "Cannot change role" });
+        }
         const user = await User.findByIdAndUpdate(req.params.id, req.body, { new: true });
         if (!user) return res.status(404).json({ error: "User not found" });
-        res.json({ message: "Updated", user });
+        res.json({ message: "Updated", user: userProfileDTO(user) });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -277,6 +513,12 @@ app.post('/api/auth/reset-password', async (req, res) => {
         
         if (!user || user.resetToken !== token) return res.status(403).json({ error: "Invalid session" });
 
+        // Validate new password strength
+        const passwordValidation = validatePassword(newPassword);
+        if (!passwordValidation.valid) {
+            return res.status(400).json({ error: "Weak password", details: passwordValidation.errors });
+        }
+
         // Hash new password with bcrypt
         const hashedPassword = await bcrypt.hash(newPassword, 10);
         user.password = hashedPassword;
@@ -291,25 +533,37 @@ app.post('/api/auth/reset-password', async (req, res) => {
 // 3. UPLOADS
 app.post('/api/driver/upload-docs', requireAuth, async (req, res) => {
     try {
+        // Verify user is uploading their own docs
+        if (req.user.userId !== req.body.userId) {
+            return res.status(403).json({ error: "Cannot upload docs for another user" });
+        }
         const user = await User.findByIdAndUpdate(req.body.userId, { 
             ...req.body, status: 'pending' 
         }, { new: true });
-        res.json({ message: "Uploaded", user });
+        res.json({ message: "Uploaded", user: userProfileDTO(user) });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/passenger/upload-docs', requireAuth, async (req, res) => {
     try {
+        // Verify user is uploading their own docs
+        if (req.user.userId !== req.body.userId) {
+            return res.status(403).json({ error: "Cannot upload docs for another user" });
+        }
         const user = await User.findByIdAndUpdate(req.body.userId, { 
             ...req.body, status: 'pending' 
         }, { new: true });
-        res.json({ message: "Uploaded", user });
+        res.json({ message: "Uploaded", user: userProfileDTO(user) });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 4. RIDES
-app.post('/api/rides', requireAuth, async (req, res) => {
+app.post('/api/rides', requireAuth, requireDriver, async (req, res) => {
     try {
+        // Verify driver is creating their own ride
+        if (req.user.userId !== req.body.driver_id) {
+            return res.status(403).json({ error: "Can only create rides for yourself" });
+        }
         const driver = await User.findById(req.body.driver_id);
         if(driver.status !== 'verified') return res.status(403).json({ error: "Not Verified" });
         if(driver.trip_count >= 5 && !driver.is_subscribed) return res.status(403).json({ error: "Subscription Required" });
@@ -324,21 +578,36 @@ app.post('/api/rides', requireAuth, async (req, res) => {
 app.get('/api/rides', requireAuth, async (req, res) => {
     try {
         const rides = await Ride.find({ is_active: true }).populate('driver_id', 'name profile_photo car_model car_color car_plate status age bio preferences');
-        res.json(rides);
+        // Transform driver data using DTO
+        const ridesWithDTOs = rides.map(ride => ({
+            ...ride.toObject(),
+            driver_id: ride.driver_id ? driverListingDTO(ride.driver_id) : null
+        }));
+        res.json(ridesWithDTOs);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/driver/:id/rides', requireAuth, async (req, res) => {
     try {
         const rides = await Ride.find({ driver_id: req.params.id }).populate('passengers', 'name phone profile_photo email');
-        res.json(rides);
+        // Transform passenger data using DTO
+        const ridesWithDTOs = rides.map(ride => ({
+            ...ride.toObject(),
+            passengers: ride.passengers.map(p => passengerListingDTO(p))
+        }));
+        res.json(ridesWithDTOs);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/passenger/:id/rides', requireAuth, async (req, res) => {
     try {
         const rides = await Ride.find({ passengers: req.params.id }).populate('driver_id', 'name phone profile_photo car_model car_plate car_color');
-        res.json(rides);
+        // Transform driver data using DTO
+        const ridesWithDTOs = rides.map(ride => ({
+            ...ride.toObject(),
+            driver_id: ride.driver_id ? driverListingDTO(ride.driver_id) : null
+        }));
+        res.json(ridesWithDTOs);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -377,14 +646,14 @@ app.post('/api/pay', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/admin/pending-users', requireAuth, async (req, res) => {
+app.get('/api/admin/pending-users', requireAuth, requireAdmin, async (req, res) => {
     try {
         const users = await User.find({ status: 'pending' });
-        res.json(users);
+        res.json(users.map(u => adminUserDTO(u)));
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/admin/verify-user/:id', requireAuth, async (req, res) => {
+app.patch('/api/admin/verify-user/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.params.id, { status: 'verified' }, { new: true });
         if(user) await sendNotification(user.email, "Verified!", "Your RipeRide account is verified. You now have full access.");
@@ -392,7 +661,7 @@ app.patch('/api/admin/verify-user/:id', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/admin/reject-user/:id', requireAuth, async (req, res) => {
+app.patch('/api/admin/reject-user/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.params.id, { status: 'rejected' }, { new: true });
         if(user) await sendNotification(user.email, "Verification Failed", "Please re-upload clear documents.");
@@ -400,7 +669,7 @@ app.patch('/api/admin/reject-user/:id', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/admin/users', requireAuth, async (req, res) => {
+app.delete('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     try {
         await User.deleteMany({ role: { $in: ['passenger', 'driver'] } });
         await Ride.deleteMany({});
@@ -409,14 +678,14 @@ app.delete('/api/admin/users', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/admin/transactions', requireAuth, async (req, res) => {
+app.get('/api/admin/transactions', requireAuth, requireAdmin, async (req, res) => {
     try {
         const txns = await Transaction.find({ status: 'Pending' });
         res.json(txns);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/admin/verify-transaction/:id', requireAuth, async (req, res) => {
+app.patch('/api/admin/verify-transaction/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const txn = await Transaction.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
         if(req.body.status === 'Verified') {
@@ -433,7 +702,7 @@ app.patch('/api/admin/verify-transaction/:id', requireAuth, async (req, res) => 
 
 // 6. SYSTEM SETTINGS
 app.get('/api/settings', async (req, res) => { const s = await Settings.findOne(); res.json(s); });
-app.post('/api/admin/settings', async (req, res) => { const s = await Settings.findOneAndUpdate({}, req.body, { new: true, upsert: true }); res.json(s); });
+app.post('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => { const s = await Settings.findOneAndUpdate({}, req.body, { new: true, upsert: true }); res.json(s); });
 
 // 7. SEEDING (SECURE)
 async function seedSuperAdmin() {
@@ -461,10 +730,13 @@ async function seedSuperAdmin() {
 }
 async function seedDefaultSettings() { const e = await Settings.findOne(); if (!e) await new Settings({}).save(); }
 
-app.post('/api/admin/create-admin', requireAuth, async (req, res) => {
+app.post('/api/admin/create-admin', requireAuth, requireSuperAdmin, async (req, res) => {
     try {
-        const creator = await User.findById(req.body.creatorId);
-        if (!creator || creator.role !== 'super_admin') return res.status(403).json({ error: "Unauthorized" });
+        // Validate password
+        const validation = validatePassword(req.body.newPassword);
+        if (!validation.valid) {
+            return res.status(400).json({ error: "Weak password", details: validation.errors });
+        }
         
         // Hash new admin password
         const hashedPassword = await bcrypt.hash(req.body.newPassword, 10);
