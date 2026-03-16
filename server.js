@@ -5,6 +5,8 @@ const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const path = require('path');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 // --- LOAD ENV VARS ---
 try {
@@ -19,8 +21,37 @@ try {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+// --- CORS CONFIGURATION (SECURED) ---
+app.use(cors({
+    origin: function(origin, callback) {
+        const allowedOrigins = [
+            'https://rip3.netlify.app'
+        ];
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(bodyParser.json({ limit: '50mb' }));
+
+// --- AUTHENTICATION MIDDLEWARE ---
+const requireAuth = (req, res, next) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) return res.status(401).json({ error: "Unauthorized: Missing token" });
+        
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default-secret-key');
+        req.user = decoded;
+        next();
+    } catch (err) {
+        return res.status(403).json({ error: "Forbidden: Invalid token" });
+    }
+};
 
 // --- DATABASE CONNECTION (SECURED) ---
 const dbURI = process.env.MONGO_URI;
@@ -142,17 +173,40 @@ app.post('/api/auth/signup', async (req, res) => {
         const existing = await User.findOne({ email: req.body.email });
         if(existing) return res.status(400).json({ error: "Email already registered." });
 
-        const user = new User({ ...req.body, status: 'pending' });
+        // Hash password with bcrypt (salt rounds: 10)
+        const hashedPassword = await bcrypt.hash(req.body.password, 10);
+
+        const user = new User({ ...req.body, password: hashedPassword, status: 'pending' });
         await user.save();
-        res.json({ message: "Account created", user });
+
+        // Remove sensitive data before sending response
+        const userResponse = user.toObject();
+        delete userResponse.password;
+
+        res.json({ message: "Account created", user: userResponse });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const user = await User.findOne({ email: req.body.identifier, password: req.body.password });
+        const user = await User.findOne({ email: req.body.identifier });
         if (!user) return res.status(400).json({ error: "Invalid credentials" });
-        res.json(user);
+
+        // Compare plaintext password with hashed password using bcrypt
+        const passwordMatch = await bcrypt.compare(req.body.password, user.password);
+        if (!passwordMatch) return res.status(400).json({ error: "Invalid credentials" });
+
+        // Generate JWT token (24 hour expiry)
+        const token = jwt.sign(
+            { userId: user._id, email: user.email, role: user.role },
+            process.env.JWT_SECRET || 'default-secret-key',
+            { expiresIn: '24h' }
+        );
+
+        const userResponse = user.toObject();
+        delete userResponse.password;
+
+        res.json({ message: "Login successful", token, user: userResponse });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -223,7 +277,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
         
         if (!user || user.resetToken !== token) return res.status(403).json({ error: "Invalid session" });
 
-        user.password = newPassword; 
+        // Hash new password with bcrypt
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        user.password = hashedPassword;
         user.resetToken = undefined; 
         await user.save();
 
@@ -233,7 +289,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // 3. UPLOADS
-app.post('/api/driver/upload-docs', async (req, res) => {
+app.post('/api/driver/upload-docs', requireAuth, async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.body.userId, { 
             ...req.body, status: 'pending' 
@@ -242,7 +298,7 @@ app.post('/api/driver/upload-docs', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/passenger/upload-docs', async (req, res) => {
+app.post('/api/passenger/upload-docs', requireAuth, async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.body.userId, { 
             ...req.body, status: 'pending' 
@@ -252,7 +308,7 @@ app.post('/api/passenger/upload-docs', async (req, res) => {
 });
 
 // 4. RIDES
-app.post('/api/rides', async (req, res) => {
+app.post('/api/rides', requireAuth, async (req, res) => {
     try {
         const driver = await User.findById(req.body.driver_id);
         if(driver.status !== 'verified') return res.status(403).json({ error: "Not Verified" });
@@ -265,35 +321,35 @@ app.post('/api/rides', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/rides', async (req, res) => {
+app.get('/api/rides', requireAuth, async (req, res) => {
     try {
         const rides = await Ride.find({ is_active: true }).populate('driver_id', 'name profile_photo car_model car_color car_plate status age bio preferences');
         res.json(rides);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/driver/:id/rides', async (req, res) => {
+app.get('/api/driver/:id/rides', requireAuth, async (req, res) => {
     try {
         const rides = await Ride.find({ driver_id: req.params.id }).populate('passengers', 'name phone profile_photo email');
         res.json(rides);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/passenger/:id/rides', async (req, res) => {
+app.get('/api/passenger/:id/rides', requireAuth, async (req, res) => {
     try {
         const rides = await Ride.find({ passengers: req.params.id }).populate('driver_id', 'name phone profile_photo car_model car_plate car_color');
         res.json(rides);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/rides/:id', async (req, res) => {
+app.patch('/api/rides/:id', requireAuth, async (req, res) => {
     try {
         const ride = await Ride.findByIdAndUpdate(req.params.id, req.body, { new: true });
         res.json(ride);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/rides/:id/sos', async (req, res) => {
+app.post('/api/rides/:id/sos', requireAuth, async (req, res) => {
     try {
         const ride = await Ride.findByIdAndUpdate(req.params.id, { sos_alert: true }, { new: true });
         // Email Admin for SOS
@@ -304,7 +360,7 @@ app.post('/api/rides/:id/sos', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/rides/:id/location', async (req, res) => {
+app.patch('/api/rides/:id/location', requireAuth, async (req, res) => {
     try {
         const { lat, lng } = req.body;
         await Ride.findByIdAndUpdate(req.params.id, { location: { lat, lng } });
@@ -313,7 +369,7 @@ app.patch('/api/rides/:id/location', async (req, res) => {
 });
 
 // 5. PAYMENTS & ADMIN
-app.post('/api/pay', async (req, res) => {
+app.post('/api/pay', requireAuth, async (req, res) => {
     try {
         const txn = new Transaction({ ...req.body, status: 'Pending' });
         await txn.save();
@@ -321,14 +377,14 @@ app.post('/api/pay', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/admin/pending-users', async (req, res) => {
+app.get('/api/admin/pending-users', requireAuth, async (req, res) => {
     try {
         const users = await User.find({ status: 'pending' });
         res.json(users);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/admin/verify-user/:id', async (req, res) => {
+app.patch('/api/admin/verify-user/:id', requireAuth, async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.params.id, { status: 'verified' }, { new: true });
         if(user) await sendNotification(user.email, "Verified!", "Your RipeRide account is verified. You now have full access.");
@@ -336,7 +392,7 @@ app.patch('/api/admin/verify-user/:id', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/admin/reject-user/:id', async (req, res) => {
+app.patch('/api/admin/reject-user/:id', requireAuth, async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.params.id, { status: 'rejected' }, { new: true });
         if(user) await sendNotification(user.email, "Verification Failed", "Please re-upload clear documents.");
@@ -344,7 +400,7 @@ app.patch('/api/admin/reject-user/:id', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/admin/users', async (req, res) => {
+app.delete('/api/admin/users', requireAuth, async (req, res) => {
     try {
         await User.deleteMany({ role: { $in: ['passenger', 'driver'] } });
         await Ride.deleteMany({});
@@ -353,14 +409,14 @@ app.delete('/api/admin/users', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/admin/transactions', async (req, res) => {
+app.get('/api/admin/transactions', requireAuth, async (req, res) => {
     try {
         const txns = await Transaction.find({ status: 'Pending' });
         res.json(txns);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/admin/verify-transaction/:id', async (req, res) => {
+app.patch('/api/admin/verify-transaction/:id', requireAuth, async (req, res) => {
     try {
         const txn = await Transaction.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
         if(req.body.status === 'Verified') {
@@ -388,10 +444,12 @@ async function seedSuperAdmin() {
     if (adminEmail && adminPass) {
         const exists = await User.findOne({ email: adminEmail });
         if (!exists) {
+            // Hash password before storing
+            const hashedPassword = await bcrypt.hash(adminPass, 10);
             await new User({ 
                 role: 'super_admin',
                 email: adminEmail, 
-                password: adminPass, 
+                password: hashedPassword, 
                 name: 'Super Admin', 
                 status: 'verified' 
             }).save();
@@ -403,15 +461,18 @@ async function seedSuperAdmin() {
 }
 async function seedDefaultSettings() { const e = await Settings.findOne(); if (!e) await new Settings({}).save(); }
 
-app.post('/api/admin/create-admin', async (req, res) => {
+app.post('/api/admin/create-admin', requireAuth, async (req, res) => {
     try {
         const creator = await User.findById(req.body.creatorId);
         if (!creator || creator.role !== 'super_admin') return res.status(403).json({ error: "Unauthorized" });
         
+        // Hash new admin password
+        const hashedPassword = await bcrypt.hash(req.body.newPassword, 10);
+        
         const newAdmin = new User({ 
             role: 'admin', 
             email: req.body.newEmail, 
-            password: req.body.newPassword, 
+            password: hashedPassword, 
             name: req.body.newName, 
             status: 'verified' 
         });
