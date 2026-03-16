@@ -114,7 +114,7 @@ const UserSchema = new mongoose.Schema({
     name: String,
     age: Number,
     email: { type: String, unique: true, required: true }, 
-    password: String, 
+    password: { type: String, select: false }, // Never include in responses by default
     phone: String,
     
     // Docs
@@ -179,17 +179,13 @@ app.post('/api/auth/signup', async (req, res) => {
         const user = new User({ ...req.body, password: hashedPassword, status: 'pending' });
         await user.save();
 
-        // Remove sensitive data before sending response
-        const userResponse = user.toObject();
-        delete userResponse.password;
-
-        res.json({ message: "Account created", user: userResponse });
+        res.json({ message: "Account created", user: { _id: user._id, email: user.email, role: user.role, name: user.name, status: user.status } });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const user = await User.findOne({ email: req.body.identifier });
+        const user = await User.findOne({ email: req.body.identifier }).select('+password');
         if (!user) return res.status(400).json({ error: "Invalid credentials" });
 
         // Compare plaintext password with hashed password using bcrypt
@@ -203,23 +199,27 @@ app.post('/api/auth/login', async (req, res) => {
             { expiresIn: '24h' }
         );
 
-        const userResponse = user.toObject();
-        delete userResponse.password;
-
-        res.json({ message: "Login successful", token, user: userResponse });
+        // Return only necessary user info (NO password hash)
+        res.json({ 
+            message: "Login successful", 
+            token, 
+            user: { _id: user._id, email: user.email, role: user.role, name: user.name, status: user.status, profile_photo: user.profile_photo }
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/user/:id', async (req, res) => {
+app.get('/api/user/:id', requireAuth, async (req, res) => {
     try {
         const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ error: "User not found" });
         res.json(user);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/user/:id/profile', async (req, res) => {
+app.patch('/api/user/:id/profile', requireAuth, async (req, res) => {
     try {
         const user = await User.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        if (!user) return res.status(404).json({ error: "User not found" });
         res.json({ message: "Updated", user });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
