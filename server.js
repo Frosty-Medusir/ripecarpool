@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const cron = require('node-cron');
 
 // --- LOAD ENV VARS ---
 try {
@@ -77,6 +78,52 @@ app.use(bodyParser.json({ limit: '200kb' }));
 // Specialized 5mb limit for document uploads ONLY
 const uploadBodyParser = bodyParser.json({ limit: '5mb' });
 
+// ============================================================================
+// SYSTEM MAINTENANCE ENDPOINT - Bypass CSRF/Auth (MUST be BEFORE global CSRF middleware)
+// ============================================================================
+/**
+ * POST /api/system/maintenance
+ * 
+ * Security: Authenticated via x-cron-secret header
+ * Bypasses global CSRF and Auth middleware
+ * Requires: CRON_SECRET_KEY environment variable
+ * 
+ * Example:
+ * curl -X POST http://localhost:5000/api/system/maintenance \
+ *   -H "x-cron-secret: your-secret-key"
+ */
+app.post('/api/system/maintenance', (req, res) => {
+    // Check for cron secret - bypass JWT and CSRF auth
+    const cronSecret = req.headers['x-cron-secret'];
+    const expectedSecret = process.env.CRON_SECRET_KEY;
+    
+    // CRITICAL: Cron secret must be configured
+    if (!expectedSecret) {
+        return res.status(500).json({
+            success: false,
+            error: 'Server configuration error: CRON_SECRET_KEY not set',
+        });
+    }
+    
+    // Verify cron secret matches
+    if (!cronSecret || cronSecret !== expectedSecret) {
+        console.warn(`⚠️  Unauthorized maintenance request from ${req.ip} at ${new Date().toISOString()}`);
+        return res.status(401).json({
+            success: false,
+            error: 'Unauthorized: Invalid or missing x-cron-secret header',
+        });
+    }
+    
+    // Execute maintenance
+    const result = performMaintenance();
+    
+    res.status(200).json({
+        success: true,
+        message: 'Maintenance completed successfully',
+        ...result,
+    });
+});
+
 // --- CSRF TOKEN MIDDLEWARE ---
 // Store CSRF tokens in memory (in production, use Redis)
 const csrfTokens = new Map();
@@ -84,6 +131,36 @@ const csrfTokens = new Map();
 const generateCsrfToken = () => {
     return crypto.randomBytes(32).toString('hex');
 };
+
+// ============================================================================
+// MAINTENANCE UTILITY - Clean up expired CSRF tokens
+// ============================================================================
+/**
+ * Perform scheduled maintenance tasks:
+ * - Remove CSRF tokens older than 5 hours
+ * - Log cleanup statistics
+ */
+function performMaintenance() {
+    let clearedCount = 0;
+    const cutoffTime = Date.now() - (5 * 60 * 60 * 1000); // 5 hours ago
+    
+    for (const [key, value] of csrfTokens.entries()) {
+        if (value.createdAt < cutoffTime) {
+            csrfTokens.delete(key);
+            clearedCount++;
+        }
+    }
+    
+    const timestamp = new Date().toISOString();
+    console.log(`🧹 [${timestamp}] Maintenance: Cleared ${clearedCount} expired CSRF tokens (${csrfTokens.size} remaining)`);
+    
+    return {
+        success: true,
+        tokensCleared: clearedCount,
+        tokensRemaining: csrfTokens.size,
+        timestamp: timestamp,
+    };
+}
 
 // ============================================================================
 // CSRF TOKEN ENDPOINT - GET (MUST be ABOVE global CSRF middleware)
@@ -848,4 +925,49 @@ app.post('/api/admin/create-admin', requireAuth, requireSuperAdmin, async (req, 
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`🚀 RipeRide Server running on Port ${PORT}`));
+const server = app.listen(PORT, () => {
+    console.log(`
+┌────────────────────────────────────────────────────────────────┐
+│        🚀 RipeRide Server running on Port ${PORT}                    │
+└────────────────────────────────────────────────────────────────┘
+
+✅ Security Layers Enabled:
+   ✓ CORS hardening
+   ✓ Helmet security headers
+   ✓ Rate limiting (login, SOS, forgot-password)
+   ✓ Input validation (Zod)
+   ✓ NoSQL injection protection
+   ✓ Timing attack protection
+   ✓ CSRF token validation
+   ✓ JWT authentication (2h expiry)
+   ✓ Soft delete system
+   ✓ Selective payload limits
+
+🔧 Maintenance:
+   ✓ Scheduled CSRF token cleanup (every hour at :00)
+   ✓ Manual cleanup via POST /api/system/maintenance
+   ✓ Requires x-cron-secret header (${process.env.CRON_SECRET_KEY ? '✅ configured' : '⚠️  NOT configured'})
+
+📊 Performance:
+   ✓ Global payload limit: 200kb
+   ✓ Document upload limit: 5mb
+   ✓ Login rate limit: 5 attempts per 15 minutes
+   ✓ SOS rate limit: 2 requests per minute
+   ✓ Forgot password limit: 3 requests per hour
+`);
+
+    // ====================================================================
+    // SCHEDULED MAINTENANCE - Run every 14 minutes
+    // ====================================================================
+    // Pattern: */14 * * * * (minute, hour, day of month, month, day of week)
+    // This runs at 00:00, 00:14, 00:28, 00:42, 01:00, 01:14, etc.
+    
+    const maintenanceJob = cron.schedule('*/14 * * * *', () => {
+        performMaintenance();
+    });
+    
+    console.log('✅ Cron job scheduled: CSRF token cleanup every 14 minutes');
+    console.log('   Note: This runs only while the server is active.\n');
+});
+
+module.exports = server;

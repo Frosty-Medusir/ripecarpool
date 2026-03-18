@@ -28,6 +28,7 @@
     "jsonwebtoken": "^9.0.0",
     "mongo-sanitize": "^1.1.0",
     "mongoose": "^7.5.0",
+    "node-cron": "^3.0.2",
     "nodemailer": "^8.0.2",
     "zod": "^4.3.6"
   },
