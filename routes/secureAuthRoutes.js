@@ -49,14 +49,14 @@ const loginLimiter = rateLimit({
 // ============================================================================
 // LAYER 2: INPUT VALIDATION SCHEMA (Zod)
 // ============================================================================
-// Enforce strict validation for username (min 3 chars) and password (min 8 chars)
+// Enforce strict validation for email (proper email format) and password (min 8 chars)
 // Both must be strings. Returns 400 on validation failure.
 const loginSchema = z.object({
-    username: z
-        .string('Username must be a string')
-        .min(3, 'Username must be at least 3 characters long')
-        .max(50, 'Username must not exceed 50 characters')
-        .trim(),
+    email: z
+        .string('Email must be a string')
+        .email('Email must be a valid email address')
+        .max(255, 'Email must not exceed 255 characters')
+        .toLowerCase(),
     password: z
         .string('Password must be a string')
         .min(8, 'Password must be at least 8 characters long')
@@ -105,18 +105,18 @@ const DUMMY_HASH = '$2a$10$nOUIs5kJ7naTtVaAqe.l.OPST9/PgBkqquzi.Ss7KIUgO2t0jKMUi
 /**
  * Validate credentials with constant-time comparison
  * 
- * @param {string} username - The username from the request
+ * @param {string} email - The email from the request
  * @param {string} password - The password from the request
  * @param {Object} User - The Mongoose User model
  * @returns {Promise<Object>} - Authentication result with user data or null
  */
-async function validateCredentialsWithTimingProtection(username, password, User) {
+async function validateCredentialsWithTimingProtection(email, password, User) {
     let user = null;
     let userHash = DUMMY_HASH;
 
     // Attempt to find the user (Step 1)
     try {
-        user = await User.findOne({ username: username });
+        user = await User.findOne({ email: email });
     } catch (error) {
         console.error('Database error during user lookup:', error);
         // Don't expose database errors to client
@@ -158,14 +158,14 @@ async function validateCredentialsWithTimingProtection(username, password, User)
  * Security layers applied (in order):
  * 1. Rate Limiting (loginLimiter middleware)
  * 2. Input Sanitization (sanitizeInput middleware)
- * 3. Input Validation (Zod schema)
+ * 3. Input Validation (Zod schema with email format validation)
  * 4. NoSQL Injection Defense (mongo-sanitize in sanitizeInput)
  * 5. Timing Attack Protection (validateCredentialsWithTimingProtection)
  * 6. Security Headers (Applied globally via helmet and CORS middleware in server.js)
  * 
  * Request body:
  * {
- *   "username": "john_doe",
+ *   "email": "john@example.com",
  *   "password": "securePass123"
  * }
  * 
@@ -175,8 +175,9 @@ async function validateCredentialsWithTimingProtection(username, password, User)
  *   "message": "Login successful",
  *   "user": {
  *     "_id": "...",
- *     "username": "john_doe",
- *     "email": "john@example.com"
+ *     "email": "john@example.com",
+ *     "name": "John Doe",
+ *     "role": "passenger"
  *   },
  *   "token": "eyJhbGciOiJIUzI1NiIs..."
  * }
@@ -186,7 +187,7 @@ async function validateCredentialsWithTimingProtection(username, password, User)
  *   "success": false,
  *   "error": "Validation failed",
  *   "details": [
- *     { "field": "username", "message": "Username must be at least 3 characters long" }
+ *     { "field": "email", "message": "Email must be a valid email address" }
  *   ]
  * }
  * 
@@ -199,7 +200,7 @@ async function validateCredentialsWithTimingProtection(username, password, User)
  * Response (Invalid Credentials - 401):
  * {
  *   "success": false,
- *   "error": "Invalid username or password"
+ *   "error": "Invalid email or password"
  * }
  */
 router.post(
@@ -252,7 +253,7 @@ router.post(
                 });
             }
 
-            const { username, password } = validatedData;
+            const { email, password } = validatedData;
 
             // ================================================================
             // LAYER 4: TIMING ATTACK PROTECTION
@@ -260,7 +261,7 @@ router.post(
             // Validate credentials using constant-time comparison
             // This function handles the "dummy hash" logic internally
             const authResult = await validateCredentialsWithTimingProtection(
-                username,
+                email,
                 password,
                 User
             );
@@ -270,7 +271,7 @@ router.post(
                 // Response time is identical whether user was found or password was wrong
                 return res.status(401).json({
                     success: false,
-                    error: 'Invalid username or password',
+                    error: 'Invalid email or password',
                 });
             }
 
@@ -291,7 +292,7 @@ router.post(
             const token = jwt.sign(
                 {
                     userId: user._id,
-                    username: user.username,
+                    email: user.email,
                     role: user.role || 'user', // Add role if available
                 },
                 jwtSecret,
@@ -306,8 +307,8 @@ router.post(
                 message: 'Login successful',
                 user: {
                     _id: user._id,
-                    username: user.username,
                     email: user.email,
+                    name: user.name || 'User',
                     role: user.role || 'user',
                 },
                 token: token,
