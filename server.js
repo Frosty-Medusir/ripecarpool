@@ -66,7 +66,15 @@ app.use((req, res, next) => {
 
 // Disable x-powered-by header
 app.disable('x-powered-by');
-app.use(bodyParser.json({ limit: '50mb' }));
+
+// ============================================================================
+// SELECTIVE PAYLOAD LIMITS
+// ============================================================================
+// Global limit: 200kb (protects against payload bomb attacks)
+app.use(bodyParser.json({ limit: '200kb' }));
+
+// Specialized 5mb limit for document uploads ONLY
+const uploadBodyParser = bodyParser.json({ limit: '5mb' });
 
 // --- CSRF TOKEN MIDDLEWARE ---
 // Store CSRF tokens in memory (in production, use Redis)
@@ -75,6 +83,57 @@ const csrfTokens = new Map();
 const generateCsrfToken = () => {
     return crypto.randomBytes(32).toString('hex');
 };
+
+// ============================================================================
+// CSRF TOKEN ENDPOINT - GET (MUST be ABOVE global CSRF middleware)
+// ============================================================================
+app.get('/api/csrf-token', (req, res) => {
+    const token = generateCsrfToken();
+    csrfTokens.set(token, { createdAt: Date.now() });
+    
+    // Clean up expired tokens (older than 5 hours)
+    for (const [key, value] of csrfTokens.entries()) {
+        if (Date.now() - value.createdAt > 5 * 60 * 60 * 1000) {
+            csrfTokens.delete(key);
+        }
+    }
+    
+    res.json({ csrfToken: token });
+});
+
+// ============================================================================
+// RATE LIMITING - EMAIL & SOS PROTECTION
+// ============================================================================
+// Prevent brute-force on password reset
+const forgotPasswordLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 3, // 3 requests per hour
+    message: 'Too many password reset requests. Please try again after 1 hour.',
+    standardHeaders: false,
+    legacyHeaders: false,
+    handler: (req, res) => {
+        res.status(429).json({
+            success: false,
+            error: 'Too many password reset requests. Please try again after 1 hour.',
+        });
+    },
+});
+
+// Prevent SOS spam that triggers notifications
+const sosLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 2, // 2 requests per minute
+    message: 'SOS limit exceeded. Please wait before sending another alert.',
+    standardHeaders: false,
+    legacyHeaders: false,
+    handler: (req, res) => {
+        res.status(429).json({
+            success: false,
+            error: 'SOS limit exceeded. Please wait before sending another alert.',
+            retryAfter: req.rateLimit.resetTime,
+        });
+    },
+});
 
 // CSRF token validation middleware
 const validateCsrfToken = (req, res, next) => {
@@ -118,16 +177,38 @@ app.use((req, res, next) => {
     }
 });
 
+// ============================================================================
+// JWT SECURITY - REQUIRED SECRET & SHORT EXPIRY
+// ============================================================================
+// CRITICAL: Throw error if JWT_SECRET is missing
+if (!process.env.JWT_SECRET) {
+    console.error('🔴 FATAL ERROR: JWT_SECRET is not set in environment variables!');
+    console.error('   Set JWT_SECRET in your .env file before starting the server.');
+    process.exit(1);
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRY = '2h'; // Changed from 24h to 2h for better security
+
 // --- AUTHENTICATION MIDDLEWARE ---
 const requireAuth = (req, res, next) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
         if (!token) return res.status(401).json({ error: "Unauthorized: Missing token" });
         
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default-secret-key');
+        const decoded = jwt.verify(token, JWT_SECRET);
         req.user = decoded;
         next();
     } catch (err) {
+        // 400 = Token expired, client should refresh;
+        // 403 = Invalid signature/malformed
+        if (err.name === 'TokenExpiredError') {
+            return res.status(401).json({ 
+                error: "Token expired",
+                code: 'TOKEN_EXPIRED',
+                message: 'Your session has expired. Please log in again.'
+            });
+        }
         return res.status(403).json({ error: "Forbidden: Invalid token" });
     }
 };
@@ -333,8 +414,14 @@ const UserSchema = new mongoose.Schema({
     is_subscribed: { type: Boolean, default: false },
     status: { type: String, default: 'pending' },
     
-    otpHash: String, otpExpires: Date, lastOtpSent: Date, resetToken: String
-});
+    otpHash: String, otpExpires: Date, lastOtpSent: Date, resetToken: String,
+    
+    // Soft Delete - archive users instead of permanent deletion
+    deletedAt: { type: Date, default: null },
+    
+    // Timestamps
+    createdAt: { type: Date, default: Date.now }
+}, { timestamps: true });
 
 const TransactionSchema = new mongoose.Schema({
     code: String, user_id: String, user_name: String, type: String, amount: Number, ride_id: String,
@@ -350,8 +437,14 @@ const RideSchema = new mongoose.Schema({
     passengers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
     is_active: { type: Boolean, default: true },
     sos_alert: { type: Boolean, default: false },
-    location: { lat: Number, lng: Number }
-});
+    location: { lat: Number, lng: Number },
+    
+    // Soft Delete - archive rides instead of permanent deletion
+    deletedAt: { type: Date, default: null },
+    
+    // Timestamps
+    createdAt: { type: Date, default: Date.now }
+}, { timestamps: true });
 
 const User = mongoose.model('User', UserSchema);
 const Ride = mongoose.model('Ride', RideSchema);
@@ -363,21 +456,6 @@ const secureAuthRoutes = require('./routes/secureAuthRoutes');
 app.use('/api/auth', secureAuthRoutes(User));
 
 // --- ROUTES ---
-
-// 0. CSRF TOKEN ENDPOINT
-app.post('/api/csrf-token', (req, res) => {
-    const token = generateCsrfToken();
-    csrfTokens.set(token, { createdAt: Date.now() });
-    
-    // Clean up expired tokens (older than 5 hours)
-    for (const [key, value] of csrfTokens.entries()) {
-        if (Date.now() - value.createdAt > 5 * 60 * 60 * 1000) {
-            csrfTokens.delete(key);
-        }
-    }
-    
-    res.json({ csrfToken: token });
-});
 
 // 1. AUTH
 app.post('/api/auth/signup', async (req, res) => {
@@ -405,11 +483,11 @@ app.post('/api/auth/signup', async (req, res) => {
         const user = new User({ ...req.body, password: hashedPassword, role: allowedRole, status: 'pending' });
         const savedUser = await user.save();
 
-        // Generate JWT token (24 hour expiry)
+        // Generate JWT token (2 hour expiry - clients must implement refresh token logic)
         const token = jwt.sign(
             { userId: savedUser._id, email: savedUser.email, role: savedUser.role },
-            process.env.JWT_SECRET || 'default-secret-key',
-            { expiresIn: '24h' }
+            JWT_SECRET,
+            { expiresIn: JWT_EXPIRY }
         );
 
         // Generate CSRF token for future requests
@@ -448,7 +526,7 @@ app.patch('/api/user/:id/profile', requireAuth, requireOwnerOrAdmin, async (req,
 });
 
 // 2. OTP & RESET
-app.post('/api/auth/forgot-password', async (req, res) => {
+app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
     try {
         const { email } = req.body;
         const user = await User.findOne({ email });
@@ -518,7 +596,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // 3. UPLOADS
-app.post('/api/driver/upload-docs', requireAuth, async (req, res) => {
+app.post('/api/driver/upload-docs', requireAuth, uploadBodyParser, async (req, res) => {
     try {
         // Verify user is uploading their own docs
         if (req.user.userId !== req.body.userId) {
@@ -531,7 +609,7 @@ app.post('/api/driver/upload-docs', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/passenger/upload-docs', requireAuth, async (req, res) => {
+app.post('/api/passenger/upload-docs', requireAuth, uploadBodyParser, async (req, res) => {
     try {
         // Verify user is uploading their own docs
         if (req.user.userId !== req.body.userId) {
@@ -605,7 +683,7 @@ app.patch('/api/rides/:id', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/rides/:id/sos', requireAuth, async (req, res) => {
+app.post('/api/rides/:id/sos', requireAuth, sosLimiter, async (req, res) => {
     try {
         const ride = await Ride.findByIdAndUpdate(req.params.id, { sos_alert: true }, { new: true });
         // Email Admin for SOS
@@ -658,12 +736,41 @@ app.patch('/api/admin/reject-user/:id', requireAuth, requireAdmin, async (req, r
 
 app.delete('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     try {
-        await User.deleteMany({ role: { $in: ['passenger', 'driver'] } });
-        await Ride.deleteMany({});
-        await Transaction.deleteMany({});
-        res.json({ success: true, message: "Database Wiped" });
+        // SOFT DELETE: Archive users instead of permanent deletion
+        await User.updateMany(
+            { role: { $in: ['passenger', 'driver'] } },
+            {
+                deletedAt: new Date(),
+                status: 'archived'
+            }
+        );
+        
+        // SOFT DELETE: Archive all rides
+        await Ride.updateMany(
+            {},
+            {
+                deletedAt: new Date(),
+                is_active: false,
+                status: 'archived'
+            }
+        );
+        
+        // Keep transaction records for audit trail
+        res.json({ success: true, message: "User data archived (soft delete), transactions preserved for audit" });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ============================================================================
+// HELPER: Filter out soft-deleted records
+// ============================================================================
+// Use this in queries to exclude archived data
+const findActiveUsers = (query = {}) => {
+    return User.find({ ...query, deletedAt: null });
+};
+
+const findActiveRides = (query = {}) => {
+    return Ride.find({ ...query, deletedAt: null });
+};
 
 app.get('/api/admin/transactions', requireAuth, requireAdmin, async (req, res) => {
     try {
