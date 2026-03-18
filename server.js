@@ -1,6 +1,8 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const helmet = require('helmet');
+const mongoSanitize = require('mongo-sanitize');
 const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
@@ -21,50 +23,49 @@ try {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// --- SECURITY HEADERS MIDDLEWARE ---
+// ============================================================================
+// CORS HARDENING - Restrict to specific origin
+// ============================================================================
+const corsOptions = {
+    origin: process.env.FRONTEND_ORIGIN || 'https://rip3.netlify.app',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
+    credentials: true,
+    maxAge: 86400,
+};
+app.use(cors(corsOptions));
+
+// ============================================================================
+// HELMET - Standard Security Headers
+// ============================================================================
+app.use(helmet({
+    hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true,
+    },
+    frameguard: {
+        action: 'deny',
+    },
+    contentSecurityPolicy: false, // We set custom CSP below
+}));
+
+// ============================================================================
+// CUSTOM CONTENT SECURITY POLICY (CSP)
+// ============================================================================
 app.use((req, res, next) => {
-    // Content Security Policy - prevent XSS and injection attacks
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https://medusir-backend.onrender.com");
-    
-    // Prevent MIME sniffing
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    
-    // Clickjacking protection
-    res.setHeader('X-Frame-Options', 'DENY');
-    
-    // XSS Protection (legacy browsers)
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    
-    // HSTS - Force HTTPS
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
-    
-    // Referrer policy
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    
-    // Disable cached sensitive data
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    
+    const backendDomain = process.env.BACKEND_DOMAIN || 'https://medusir-backend.onrender.com';
+    res.setHeader(
+        'Content-Security-Policy',
+        `default-src 'self'; script-src 'self' ${backendDomain}; style-src 'self' 'unsafe-inline'; ` +
+        `img-src 'self' data: https:; font-src 'self'; connect-src 'self' ${backendDomain}; ` +
+        `object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests;`
+    );
     next();
 });
 
-// --- CORS CONFIGURATION (SECURED) ---
-app.use(cors({
-    origin: function(origin, callback) {
-        const allowedOrigins = [
-            'https://rip3.netlify.app'
-        ];
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token']
-}));
+// Disable x-powered-by header
+app.disable('x-powered-by');
 app.use(bodyParser.json({ limit: '50mb' }));
 
 // --- CSRF TOKEN MIDDLEWARE ---
@@ -103,8 +104,13 @@ const validateCsrfToken = (req, res, next) => {
     next();
 };
 
-// Apply CSRF validation to all state-changing requests
+// Apply CSRF validation to all state-changing requests (except /api/auth routes)
 app.use((req, res, next) => {
+    // Skip CSRF validation for authentication routes (they use JWT, not session cookies)
+    if (req.path.startsWith('/api/auth')) {
+        return next();
+    }
+    
     if (['POST', 'PATCH', 'DELETE'].includes(req.method)) {
         validateCsrfToken(req, res, next);
     } else {
@@ -352,6 +358,10 @@ const Ride = mongoose.model('Ride', RideSchema);
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 const Settings = mongoose.model('Settings', SettingsSchema);
 
+// Initialize Secure Authentication Routes with User model
+const secureAuthRoutes = require('./routes/secureAuthRoutes');
+app.use('/api/auth', secureAuthRoutes(User));
+
 // --- ROUTES ---
 
 // 0. CSRF TOKEN ENDPOINT
@@ -410,35 +420,12 @@ app.post('/api/auth/signup', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const user = await User.findOne({ email: req.body.identifier }).select('+password');
-        if (!user) return res.status(400).json({ error: "Invalid credentials" });
-
-        // Compare plaintext password with hashed password using bcrypt
-        const passwordMatch = await bcrypt.compare(req.body.password, user.password);
-        if (!passwordMatch) return res.status(400).json({ error: "Invalid credentials" });
-
-        // Generate JWT token (24 hour expiry)
-        const token = jwt.sign(
-            { userId: user._id, email: user.email, role: user.role },
-            process.env.JWT_SECRET || 'default-secret-key',
-            { expiresIn: '24h' }
-        );
-
-        // Generate CSRF token for future requests
-        const csrfToken = generateCsrfToken();
-        csrfTokens.set(csrfToken, { createdAt: Date.now() });
-
-        // Return only necessary user info (NO password hash)
-        res.json({ 
-            message: "Login successful", 
-            token, 
-            csrfToken,
-            user: userAuthDTO(user)
-        });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
+// ============================================================================
+// SECURE AUTHENTICATION ROUTES (6 Security Layers)
+// ============================================================================
+// Includes: Rate Limiting, Input Validation, NoSQL Injection Defense,
+// Timing Attack Protection, CORS, and Security Headers
+// NOTE: Will be initialized after User model is defined
 
 app.get('/api/user/:id', requireAuth, requireOwnerOrAdmin, async (req, res) => {
     try {
