@@ -49,17 +49,19 @@ const loginLimiter = rateLimit({
 // ============================================================================
 // LAYER 2: INPUT VALIDATION SCHEMA (Zod)
 // ============================================================================
-// Enforce strict validation for email (proper email format) and password (min 8 chars)
+// Enforce strict validation for email (proper RFC-compliant email format) 
+// and password (minimum 8 characters as required by audit)
 // Both must be strings. Returns 400 on validation failure.
+// If validation fails here, user never reaches bcrypt comparison (safe)
 const loginSchema = z.object({
     email: z
         .string('Email must be a string')
-        .email('Email must be a valid email address')
+        .email('Email must be a valid email address') // RFC-compliant email validation
         .max(255, 'Email must not exceed 255 characters')
-        .toLowerCase(),
+        .toLowerCase(), // Normalize to lowercase for case-insensitive comparison
     password: z
         .string('Password must be a string')
-        .min(8, 'Password must be at least 8 characters long')
+        .min(8, 'Password must be at least 8 characters long') // Audit requirement: minimum 8 chars
         .max(128, 'Password must not exceed 128 characters'),
 });
 
@@ -105,47 +107,82 @@ const DUMMY_HASH = '$2a$10$nOUIs5kJ7naTtVaAqe.l.OPST9/PgBkqquzi.Ss7KIUgO2t0jKMUi
 /**
  * Validate credentials with constant-time comparison
  * 
- * @param {string} email - The email from the request
- * @param {string} password - The password from the request
+ * CRITICAL SECURITY: This function implements timing attack protection by ensuring
+ * the response time is identical regardless of whether:
+ * - The user email doesn't exist in the database
+ * - The user email exists but password is wrong
+ * 
+ * This prevents attackers from enumerating valid email addresses by measuring response times.
+ * 
+ * @param {string} email - The email from the request (guaranteed to be valid string from Zod)
+ * @param {string} password - The password from the request (guaranteed to be valid 8+ char string from Zod)
  * @param {Object} User - The Mongoose User model
- * @returns {Promise<Object>} - Authentication result with user data or null
+ * @returns {Promise<Object>} - { success: boolean, user: userObject|null }
  */
 async function validateCredentialsWithTimingProtection(email, password, User) {
-    let user = null;
-    let userHash = DUMMY_HASH;
-
-    // Attempt to find the user (Step 1)
-    try {
-        user = await User.findOne({ email: email });
-    } catch (error) {
-        console.error('Database error during user lookup:', error);
-        // Don't expose database errors to client
+    // Defensive checks (Zod already validates, but be extra safe)
+    if (typeof email !== 'string' || !email.trim()) {
+        console.warn('⚠️  Invalid email type in validateCredentialsWithTimingProtection');
+        return { success: false, user: null };
+    }
+    
+    if (typeof password !== 'string' || password.length < 8) {
+        console.warn('⚠️  Invalid password type/length in validateCredentialsWithTimingProtection');
         return { success: false, user: null };
     }
 
-    // If user found, use their actual password hash (Step 2)
-    // If user not found, we'll use the dummy hash (already set above)
-    if (user) {
-        userHash = user.password;
+    let user = null;
+    let userHash = DUMMY_HASH; // Default to dummy hash for timing protection
+    let userFound = false;
+
+    // STEP 1: Attempt to find user in database
+    // If successful, userFound will be true and userHash will be set to user's password
+    // If unsuccessful, userFound will remain false and userHash stays as DUMMY_HASH
+    try {
+        user = await User.findOne({ email: email });
+        if (user && user.password) {
+            userFound = true;
+            userHash = user.password;
+        }
+    } catch (error) {
+        console.error('Database error during user lookup:', error);
+        // Database error - still proceed with dummy hash to maintain timing
+        // This prevents timing-based attacks even when DB has issues
+        userFound = false;
+        userHash = DUMMY_HASH;
     }
 
-    // CRITICAL: Always call bcrypt.compare() regardless of whether user was found
-    // This ensures the timing is identical (Step 3)
+    // STEP 2: CRITICAL - Always call bcrypt.compare() regardless of userFound status
+    // This is the key to timing attack protection. The comparison takes ~200ms
+    // whether the user exists or not, making it impossible to distinguish.
     let passwordMatch = false;
     try {
-        passwordMatch = await bcrypt.compare(password, userHash);
+        // Defensive check: ensure userHash is a valid string before bcrypt.compare
+        if (typeof userHash !== 'string' || !userHash.startsWith('$2a$') && !userHash.startsWith('$2b$') && !userHash.startsWith('$2y$')) {
+            console.error('⚠️  Invalid hash format for bcrypt comparison');
+            // Skip bcrypt, this error shouldn't happen in production but be safe
+            passwordMatch = false;
+        } else {
+            // Password is guaranteed to be string by Zod, userHash is either user's password or DUMMY_HASH
+            passwordMatch = await bcrypt.compare(password, userHash);
+        }
     } catch (error) {
         console.error('Bcrypt comparison error:', error);
-        // If bcrypt fails, still return false (no password match)
+        // If bcrypt.compare throws an error, treat as password mismatch
+        // This handles edge cases like malformed hashes
         passwordMatch = false;
     }
 
-    // Return generic error if password doesn't match OR user doesn't exist (Step 4)
-    if (!passwordMatch || !user) {
+    // STEP 3: Return generic error if either:
+    // - Password doesn't match, OR
+    // - User doesn't exist (even if we did dummy hash comparison)
+    // The caller cannot distinguish between these cases
+    if (!passwordMatch || !userFound) {
+        // Return generic error - doesn't reveal if user exists or password was wrong
         return { success: false, user: null };
     }
 
-    // Password matched and user exists - return success
+    // STEP 4: Password matched AND user was found - return success
     return { success: true, user: user };
 }
 
@@ -260,6 +297,7 @@ router.post(
             // ================================================================
             // Validate credentials using constant-time comparison
             // This function handles the "dummy hash" logic internally
+            // It ensures the timing is identical whether the user exists or not
             const authResult = await validateCredentialsWithTimingProtection(
                 email,
                 password,
@@ -267,37 +305,61 @@ router.post(
             );
 
             if (!authResult.success) {
-                // Return generic error message (doesn't reveal if user exists or not)
-                // Response time is identical whether user was found or password was wrong
+                // Return generic 401 error message
+                // Does not reveal whether user exists or password was wrong
+                // Response time is identical regardless of the actual failure reason
                 return res.status(401).json({
                     success: false,
                     error: 'Invalid email or password',
+                    code: 'INVALID_CREDENTIALS',
                 });
             }
 
             const user = authResult.user;
+            
+            // Safety check: ensure user exists (should never fail due to validateCredentialsWithTimingProtection logic)
+            if (!user || !user._id) {
+                console.error('❌ Critical error: user object missing after successful auth');
+                return res.status(500).json({
+                    success: false,
+                    error: 'An unexpected error occurred. Please try again.',
+                    code: 'INTERNAL_ERROR',
+                });
+            }
 
             // ================================================================
-            // GENERATE JWT TOKEN (Optional - based on your implementation)
+            // GENERATE JWT TOKEN
             // ================================================================
             // Check JWT_SECRET is configured (server.js enforces this at startup)
             const jwtSecret = process.env.JWT_SECRET;
             if (!jwtSecret) {
+                console.error('❌ JWT_SECRET not configured');
                 return res.status(500).json({
                     success: false,
-                    error: 'Server configuration error. Please contact support.'
+                    error: 'Server configuration error. Please contact support.',
+                    code: 'SERVER_CONFIG_ERROR',
                 });
             }
 
-            const token = jwt.sign(
-                {
-                    userId: user._id,
-                    email: user.email,
-                    role: user.role || 'user', // Add role if available
-                },
-                jwtSecret,
-                { expiresIn: '2h' } // Reduced from 24h to 2h
-            );
+            let token;
+            try {
+                token = jwt.sign(
+                    {
+                        userId: user._id,
+                        email: user.email,
+                        role: user.role || 'user',
+                    },
+                    jwtSecret,
+                    { expiresIn: '2h' }
+                );
+            } catch (tokenError) {
+                console.error('JWT signing error:', tokenError);
+                return res.status(500).json({
+                    success: false,
+                    error: 'Failed to generate authentication token.',
+                    code: 'TOKEN_GENERATION_ERROR',
+                });
+            }
 
             // ================================================================
             // SUCCESSFUL LOGIN RESPONSE
@@ -314,12 +376,18 @@ router.post(
                 token: token,
             });
         } catch (error) {
-            console.error('Login route error:', error);
+            // Catch unexpected errors (should rarely happen due to layer-by-layer validation)
+            console.error('❌ Login route unexpected error:', {
+                errorMessage: error.message,
+                errorType: error.name,
+                stack: error.stack,
+            });
 
-            // Return generic 500 error (don't expose internal details)
+            // Return generic 500 error (do NOT expose internal error details)
             return res.status(500).json({
                 success: false,
-                error: 'An error occurred during login. Please try again later.',
+                error: 'An unexpected error occurred during login. Please try again later.',
+                code: 'UNEXPECTED_ERROR',
             });
         }
     }
