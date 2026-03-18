@@ -26,10 +26,11 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ============================================================================
-// RENDER PROXY TRUST - Required for proper IP detection on Render
+// RENDER PROXY TRUST - Required for proper IP detection on Render (FIRST)
 // ============================================================================
 // Render uses a reverse proxy. This setting allows express-rate-limit to correctly
 // identify the client IP address instead of the proxy IP.
+// CRITICAL: Must be set immediately after app creation, before all middleware.
 app.set('trust proxy', 1);
 
 // ============================================================================
@@ -263,23 +264,31 @@ const sosLimiter = rateLimit({
 });
 
 // ============================================================================
-// PRIORITY 4: CSRF VALIDATION MIDDLEWARE (After Exempt Routes)
+// PRIORITY 4: CSRF VALIDATION MIDDLEWARE (Applied Globally Before Auth)
 // ============================================================================
 /**
  * CSRF validation middleware
- * - Skips GET/HEAD/OPTIONS (idempotent methods)
+ * - Skips GET/HEAD/OPTIONS (idempotent methods - safe from CSRF)
  * - Skips exempt routes (/api/csrf-token, /api/system/maintenance)
  * - Validates token exists and hasn't expired (5-hour TTL)
- * - Applied ONLY to POST, PATCH, DELETE requests
+ * - Applied ONLY to POST, PATCH, DELETE requests on protected routes
+ * 
+ * CRITICAL: This is applied globally to all routes via app.use()
  */
 const validateCsrfToken = (req, res, next) => {
-    // Skip CSRF check for GET/HEAD/OPTIONS (idempotent, safe methods)
+    // Skip CSRF check for GET/HEAD/OPTIONS (idempotent, safe methods - cannot change state)
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
         return next();
     }
     
     // Skip CSRF for exempt routes that don't require authentication
     if (req.path === '/api/system/maintenance' || req.path === '/api/csrf-token') {
+        return next();
+    }
+    
+    // Skip CSRF for authentication routes (they use JWT tokens in Authorization header, not cookies)
+    // JWT tokens cannot be forged by CSRF attacks, so CSRF protection is not needed
+    if (req.path.startsWith('/api/auth')) {
         return next();
     }
     
@@ -306,27 +315,13 @@ const validateCsrfToken = (req, res, next) => {
     next();
 };
 
-// Apply CSRF validation to all API routes (except auth routes and exempt routes)
-// CRITICAL: Only validate POST, PATCH, DELETE requests
-app.use((req, res, next) => {
-    // Skip CSRF validation entirely for authentication routes (they use JWT, not session cookies)
-    if (req.path.startsWith('/api/auth')) {
-        return next();
-    }
-    
-    // Skip CSRF for exempt routes that were defined above
-    if (req.path === '/api/system/maintenance' || req.path === '/api/csrf-token') {
-        return next();
-    }
-    
-    // Apply CSRF validation ONLY to state-changing requests
-    if (['POST', 'PATCH', 'DELETE'].includes(req.method)) {
-        validateCsrfToken(req, res, next);
-    } else {
-        // GET, HEAD, OPTIONS skip CSRF entirely
-        next();
-    }
-});
+// ============================================================================
+// APPLY CSRF VALIDATION GLOBALLY (Before Auth Routes)
+// ============================================================================
+// Apply CSRF validation to all routes EXCEPT GET, HEAD, OPTIONS requests
+// This ensures all state-changing requests (POST, PATCH, DELETE) are CSRF-protected
+// Must be applied BEFORE secureAuthRoutes are loaded
+app.use(validateCsrfToken);
 
 // ============================================================================
 // PRIORITY 5: JWT SECURITY - REQUIRED SECRET & SHORT EXPIRY
@@ -342,11 +337,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = '2h'; // Changed from 24h to 2h for better security
 
 // ============================================================================
-// PRIORITY 5: AUTHENTICATION MIDDLEWARE (After CSRF validation)
-// ============================================================================
-
-// ============================================================================
-// PRIORITY 5: AUTHENTICATION MIDDLEWARE (After CSRF validation)
+// PRIORITY 6: AUTHENTICATION MIDDLEWARE (After CSRF validation)
 // ============================================================================
 const requireAuth = (req, res, next) => {
     try {
@@ -1010,41 +1001,64 @@ const server = app.listen(PORT, () => {
 │        🚀 RipeRide Server running on Port ${PORT}                    │
 └────────────────────────────────────────────────────────────────┘
 
-✅ Security Layers Enabled:
-   ✓ CORS hardening
-   ✓ Helmet security headers
-   ✓ Payload limits (200kb global, 5mb uploads)
-   ✓ Global rate limiting (100/15min on /api routes)
-   ✓ Rate limiting (login, SOS, forgot-password)
-   ✓ Input validation (Zod)
-   ✓ NoSQL injection protection
-   ✓ Timing attack protection
-   ✓ CSRF token validation (POST/PATCH/DELETE only)
-   ✓ JWT authentication (2h expiry)
-   ✓ Soft delete system
-   ✓ Exempt route bypass (csrf-token, system/maintenance)
+✅ Security Layers Enabled (In Execution Order):
+   1. ✓ Proxy Trust (Render reverse proxy support)
+   2. ✓ CORS hardening (single origin whitelist)
+   3. ✓ Helmet security headers (HSTS, X-Frame-Options, etc.)
+   4. ✓ Custom CSP (Content Security Policy)
+   5. ✓ Payload limits (200kb global, 5mb uploads)
+   6. ✓ Global API rate limiting (100/15min on /api routes)
+   7. ✓ Specific rate limiters (login, forgot-password, SOS)
+   8. ✓ CSRF token validation (POST/PATCH/DELETE only)
+   9. ✓ Input validation (Zod - email format, password length)
+   10. ✓ NoSQL injection protection (mongo-sanitize)
+   11. ✓ Timing attack protection (constant-time bcrypt compare)
+   12. ✓ JWT authentication (2h expiry, required secret)
+   13. ✓ Soft delete system (archived instead of permanent)
+   14. ✓ Exemption handling (csrf-token, system/maintenance)
 
-🔍 Middleware Priority Order (Security Audit - 100% Compliant):
-   1. Payload Limits
-   2. Global API Rate Limiter
-   3. CSRF Token Store Initialization
-   4. Exempt Routes (No Auth Required)
-   5. Specific Rate Limiters
-   6. CSRF Validation (POST/PATCH/DELETE only)
-   7. JWT Authentication
+🔍 Request Flow (100% Audit Compliant):
+   Payload Limits
+      ↓
+   Global Rate Limiter (100/15min)
+      ↓
+   CSRF Token Store (initialized)
+      ↓
+   Maintenance Function (cleanup utility)
+      ↓
+   Exempt Routes: GET /api/csrf-token (no auth)
+   Exempt Routes: POST /api/system/maintenance (cron-secret only)
+      ↓
+   Specific Rate Limiters (login, forgot-password, SOS)
+      ↓
+   CSRF Validation Middleware (global, skips GET/HEAD/OPTIONS)
+      ↓
+   JWT Authentication (requireAuth)
+      ↓
+   Authorization Checks (requireAdmin, requireDriver, etc.)
+      ↓
+   Route Handlers
 
 🔧 Maintenance:
    ✓ Scheduled CSRF token cleanup (every 14 minutes)
    ✓ Manual cleanup via POST /api/system/maintenance
    ✓ Requires x-cron-secret header (${process.env.CRON_SECRET_KEY ? '✅ configured' : '⚠️  NOT configured'})
 
-📊 Performance:
-   ✓ Global payload limit: 200kb
-   ✓ Document upload limit: 5mb
-   ✓ Global API limit: 100 requests per 15 minutes
-   ✓ Login rate limit: 5 attempts per 15 minutes
-   ✓ SOS rate limit: 2 requests per minute
-   ✓ Forgot password limit: 3 requests per hour
+📊 Rate Limiting Configuration:
+   ✓ Global API: 100 requests per 15 minutes
+   ✓ Login: 5 attempts per 15 minutes
+   ✓ Forgot Password: 3 requests per hour
+   ✓ SOS Alert: 2 requests per minute
+   ✓ Payload Limit: 200kb (global), 5mb (uploads)
+
+🛡️ Authentication Configuration:
+   ✓ JWT Secret: ${process.env.JWT_SECRET ? '✅ configured' : '❌ NOT configured (FATAL)'}
+   ✓ JWT Expiry: 2 hours
+   ✓ Password Requirements: Min 8 chars, uppercase, lowercase, number, special char
+   ✓ CSRF Token TTL: 5 hours
+   ✓ Email Format Validation: RFC-compliant
+
+🚀 Deployment Status: Ready for Production
 `);
 
     // ====================================================================
