@@ -70,7 +70,7 @@ app.use((req, res, next) => {
 app.disable('x-powered-by');
 
 // ============================================================================
-// SELECTIVE PAYLOAD LIMITS
+// PRIORITY 1: SELECTIVE PAYLOAD LIMITS
 // ============================================================================
 // Global limit: 200kb (protects against payload bomb attacks)
 app.use(bodyParser.json({ limit: '200kb' }));
@@ -79,52 +79,35 @@ app.use(bodyParser.json({ limit: '200kb' }));
 const uploadBodyParser = bodyParser.json({ limit: '5mb' });
 
 // ============================================================================
-// SYSTEM MAINTENANCE ENDPOINT - Bypass CSRF/Auth (MUST be BEFORE global CSRF middleware)
+// PRIORITY 2: GLOBAL RATE LIMITING FOR /API ROUTES
 // ============================================================================
-/**
- * POST /api/system/maintenance
- * 
- * Security: Authenticated via x-cron-secret header
- * Bypasses global CSRF and Auth middleware
- * Requires: CRON_SECRET_KEY environment variable
- * 
- * Example:
- * curl -X POST http://localhost:5000/api/system/maintenance \
- *   -H "x-cron-secret: your-secret-key"
- */
-app.post('/api/system/maintenance', (req, res) => {
-    // Check for cron secret - bypass JWT and CSRF auth
-    const cronSecret = req.headers['x-cron-secret'];
-    const expectedSecret = process.env.CRON_SECRET_KEY;
-    
-    // CRITICAL: Cron secret must be configured
-    if (!expectedSecret) {
-        return res.status(500).json({
+const globalApiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // 100 requests per 15 minutes per IP
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: false,
+    legacyHeaders: false,
+    skip: (req) => {
+        // Don't apply global rate limit to already-limited endpoints
+        return req.path.includes('/api/auth/forgot-password') || 
+               req.path.includes('/api/rides') && req.method === 'POST' && req.path.includes('/sos') ||
+               req.path === '/api/system/maintenance' ||
+               req.path === '/api/csrf-token';
+    },
+    handler: (req, res) => {
+        res.status(429).json({
             success: false,
-            error: 'Server configuration error: CRON_SECRET_KEY not set',
+            error: 'Too many requests. Please try again later.',
         });
-    }
-    
-    // Verify cron secret matches
-    if (!cronSecret || cronSecret !== expectedSecret) {
-        console.warn(`⚠️  Unauthorized maintenance request from ${req.ip} at ${new Date().toISOString()}`);
-        return res.status(401).json({
-            success: false,
-            error: 'Unauthorized: Invalid or missing x-cron-secret header',
-        });
-    }
-    
-    // Execute maintenance
-    const result = performMaintenance();
-    
-    res.status(200).json({
-        success: true,
-        message: 'Maintenance completed successfully',
-        ...result,
-    });
+    },
 });
 
-// --- CSRF TOKEN MIDDLEWARE ---
+// Apply global rate limiter to all /api routes
+app.use('/api', globalApiLimiter);
+
+// ============================================================================
+// INITIALIZE CSRF TOKEN STORE
+// ============================================================================
 // Store CSRF tokens in memory (in production, use Redis)
 const csrfTokens = new Map();
 
@@ -141,14 +124,35 @@ const generateCsrfToken = () => {
  * - Log cleanup statistics
  */
 function performMaintenance() {
+    // Ensure csrfTokens is a Map before processing
+    if (!csrfTokens || typeof csrfTokens.entries !== 'function') {
+        console.error('❌ ERROR: csrfTokens is not initialized as a Map');
+        return {
+            success: false,
+            error: 'CSRF token store not initialized',
+            tokensCleared: 0,
+            tokensRemaining: 0,
+        };
+    }
+    
     let clearedCount = 0;
     const cutoffTime = Date.now() - (5 * 60 * 60 * 1000); // 5 hours ago
     
-    for (const [key, value] of csrfTokens.entries()) {
-        if (value.createdAt < cutoffTime) {
-            csrfTokens.delete(key);
-            clearedCount++;
+    try {
+        for (const [key, value] of csrfTokens.entries()) {
+            if (value && value.createdAt && value.createdAt < cutoffTime) {
+                csrfTokens.delete(key);
+                clearedCount++;
+            }
         }
+    } catch (error) {
+        console.error('❌ ERROR during CSRF token cleanup:', error);
+        return {
+            success: false,
+            error: 'Cleanup failed: ' + error.message,
+            tokensCleared: clearedCount,
+            tokensRemaining: csrfTokens.size,
+        };
     }
     
     const timestamp = new Date().toISOString();
@@ -163,24 +167,62 @@ function performMaintenance() {
 }
 
 // ============================================================================
-// CSRF TOKEN ENDPOINT - GET (MUST be ABOVE global CSRF middleware)
+// PRIORITY 3: EXEMPT ROUTES (Before CSRF/Auth middleware)
 // ============================================================================
+// GET /api/csrf-token - No auth required, generates tokens
 app.get('/api/csrf-token', (req, res) => {
     const token = generateCsrfToken();
     csrfTokens.set(token, { createdAt: Date.now() });
     
     // Clean up expired tokens (older than 5 hours)
+    let expiredCount = 0;
     for (const [key, value] of csrfTokens.entries()) {
         if (Date.now() - value.createdAt > 5 * 60 * 60 * 1000) {
             csrfTokens.delete(key);
+            expiredCount++;
         }
     }
     
-    res.json({ csrfToken: token });
+    res.json({ csrfToken: token, cleanedTokens: expiredCount });
+});
+
+// POST /api/system/maintenance - Authenticated via x-cron-secret header
+app.post('/api/system/maintenance', (req, res) => {
+    // Check for cron secret - bypass JWT and CSRF auth
+    const cronSecret = req.headers['x-cron-secret'];
+    const expectedSecret = process.env.CRON_SECRET_KEY;
+    
+    // CRITICAL: Cron secret must be configured
+    if (!expectedSecret) {
+        console.error('❌ CRON_SECRET_KEY not configured');
+        return res.status(500).json({
+            success: false,
+            error: 'Server configuration error: CRON_SECRET_KEY not set',
+        });
+    }
+    
+    // Verify cron secret matches
+    if (!cronSecret || cronSecret !== expectedSecret) {
+        console.warn(`⚠️  Unauthorized maintenance request from ${req.ip} at ${new Date().toISOString()}`);
+        return res.status(401).json({
+            success: false,
+            error: 'Unauthorized: Invalid or missing x-cron-secret header',
+        });
+    }
+    
+    // Execute maintenance (csrfTokens is now guaranteed to exist)
+    const result = performMaintenance();
+    
+    const statusCode = result.success ? 200 : 500;
+    res.status(statusCode).json({
+        success: result.success,
+        message: result.success ? 'Maintenance completed successfully' : 'Maintenance failed',
+        ...result,
+    });
 });
 
 // ============================================================================
-// RATE LIMITING - EMAIL & SOS PROTECTION
+// SPECIFIC ROUTE RATE LIMITERS
 // ============================================================================
 // Prevent brute-force on password reset
 const forgotPasswordLimiter = rateLimit({
@@ -213,10 +255,17 @@ const sosLimiter = rateLimit({
     },
 });
 
-// CSRF token validation middleware
+// ============================================================================
+// PRIORITY 4: CSRF VALIDATION MIDDLEWARE (After exempt routes)
+// ============================================================================
 const validateCsrfToken = (req, res, next) => {
     // Skip CSRF check for GET requests (they don't change data)
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+        return next();
+    }
+    
+    // Skip CSRF for exempt routes
+    if (req.path === '/api/system/maintenance' || req.path === '/api/csrf-token') {
         return next();
     }
     
@@ -248,6 +297,11 @@ app.use((req, res, next) => {
         return next();
     }
     
+    // Skip CSRF for exempt routes
+    if (req.path === '/api/system/maintenance' || req.path === '/api/csrf-token') {
+        return next();
+    }
+    
     if (['POST', 'PATCH', 'DELETE'].includes(req.method)) {
         validateCsrfToken(req, res, next);
     } else {
@@ -268,7 +322,9 @@ if (!process.env.JWT_SECRET) {
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = '2h'; // Changed from 24h to 2h for better security
 
-// --- AUTHENTICATION MIDDLEWARE ---
+// ============================================================================
+// PRIORITY 5: AUTHENTICATION MIDDLEWARE (After CSRF validation)
+// ============================================================================
 const requireAuth = (req, res, next) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
