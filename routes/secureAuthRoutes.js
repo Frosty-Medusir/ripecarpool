@@ -238,6 +238,13 @@ router.post(
                     }];
                 }
 
+                // Debug logging - helps troubleshoot validation issues in production
+                console.warn('❌ Login Validation Failed:', JSON.stringify({
+                    requestBody: req.body,
+                    validationErrors: fieldErrors,
+                    timestamp: new Date().toISOString(),
+                }, null, 2));
+
                 return res.status(400).json({
                     success: false,
                     error: 'Validation failed',
@@ -272,14 +279,23 @@ router.post(
             // ================================================================
             // GENERATE JWT TOKEN (Optional - based on your implementation)
             // ================================================================
+            // Check JWT_SECRET is configured (server.js enforces this at startup)
+            const jwtSecret = process.env.JWT_SECRET;
+            if (!jwtSecret) {
+                return res.status(500).json({
+                    success: false,
+                    error: 'Server configuration error. Please contact support.'
+                });
+            }
+
             const token = jwt.sign(
                 {
                     userId: user._id,
                     username: user.username,
                     role: user.role || 'user', // Add role if available
                 },
-                process.env.JWT_SECRET || 'your-secret-key-change-in-production',
-                { expiresIn: '24h' }
+                jwtSecret,
+                { expiresIn: '2h' } // Reduced from 24h to 2h
             );
 
             // ================================================================
