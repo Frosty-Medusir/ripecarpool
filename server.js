@@ -26,6 +26,13 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ============================================================================
+// RENDER PROXY TRUST - Required for proper IP detection on Render
+// ============================================================================
+// Render uses a reverse proxy. This setting allows express-rate-limit to correctly
+// identify the client IP address instead of the proxy IP.
+app.set('trust proxy', 1);
+
+// ============================================================================
 // CORS HARDENING - Restrict to specific origin
 // ============================================================================
 const corsOptions = {
